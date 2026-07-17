@@ -1,0 +1,222 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, staging]
+  pull_request:
+    branches: [main]
+
+env:
+  REGISTRY: us-central1-docker.pkg.dev
+  IMAGE_NAME: feature-flag-service
+
+jobs:
+  lint-and-test:
+    name: Lint & Test
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: featureflags
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Unit tests
+        run: npm run test -- --coverage
+        env:
+          NODE_ENV: test
+
+      - name: Integration tests
+        run: npm run test:e2e
+        env:
+          NODE_ENV: test
+          DB_HOST: localhost
+          DB_PORT: 5432
+          DB_USER: postgres
+          DB_PASSWORD: postgres
+          DB_NAME: featureflags
+          DB_SSL: "false"
+          REDIS_HOST: localhost
+          REDIS_PORT: 6379
+
+  build-and-push:
+    name: Build & Push Container
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+    if: github.event_name == 'push'
+    permissions:
+      contents: read
+      id-token: write
+
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tags }}
+      short_sha: ${{ steps.meta.outputs.version }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker us-central1-docker.pkg.dev
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ secrets.GCP_PROJECT_ID }}/${{ env.IMAGE_NAME }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=,suffix=,format=short
+            type=ref,event=branch
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          target: production
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.ref == 'refs/heads/staging'
+    environment: staging
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+
+      - name: Deploy to Cloud Run (Staging)
+        uses: google-github-actions/deploy-cloudrun@v2
+        with:
+          service: feature-flag-service
+          region: us-central1
+          image: ${{ env.REGISTRY }}/${{ secrets.GCP_PROJECT_ID }}/${{ env.IMAGE_NAME }}/${{ env.IMAGE_NAME }}:${{ needs.build-and-push.outputs.short_sha }}
+          flags: '--traffic-tag=canary --no-traffic'
+
+      - name: Smoke test new revision
+        run: |
+          CANARY_URL=$(gcloud run services describe feature-flag-service \
+            --region=us-central1 \
+            --format='value(status.traffic[].url)' | head -1)
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$CANARY_URL/api/v1/health")
+          if [ "$STATUS" != "200" ]; then
+            echo "Health check failed with status $STATUS"
+            exit 1
+          fi
+
+      - name: Route 100% traffic to new revision (Staging)
+        run: |
+          gcloud run services update-traffic feature-flag-service \
+            --region=us-central1 \
+            --to-latest
+
+  deploy-production:
+    name: Deploy to Production (Blue-Green)
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.ref == 'refs/heads/main'
+    environment: production
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+
+      - name: Deploy new revision (0% traffic — green)
+        uses: google-github-actions/deploy-cloudrun@v2
+        with:
+          service: feature-flag-service
+          region: us-central1
+          image: ${{ env.REGISTRY }}/${{ secrets.GCP_PROJECT_ID }}/${{ env.IMAGE_NAME }}/${{ env.IMAGE_NAME }}:${{ needs.build-and-push.outputs.short_sha }}
+          flags: '--no-traffic'
+
+      - name: Canary: route 10% traffic to new revision
+        run: |
+          NEW_REVISION=$(gcloud run services describe feature-flag-service \
+            --region=us-central1 \
+            --format='value(status.latestCreatedRevisionName)')
+          gcloud run services update-traffic feature-flag-service \
+            --region=us-central1 \
+            --to-revisions="$NEW_REVISION=10"
+
+      - name: Wait and validate canary
+        run: |
+          sleep 60
+          ERROR_RATE=$(gcloud logging read \
+            'resource.type="cloud_run_revision" severity=ERROR' \
+            --limit=100 --format=json | python3 -c "import sys,json; logs=json.load(sys.stdin); print(len(logs))")
+          if [ "$ERROR_RATE" -gt "5" ]; then
+            echo "Too many errors during canary — rolling back"
+            gcloud run services update-traffic feature-flag-service \
+              --region=us-central1 \
+              --to-latest
+            exit 1
+          fi
+
+      - name: Promote: route 100% traffic to new revision
+        run: |
+          gcloud run services update-traffic feature-flag-service \
+            --region=us-central1 \
+            --to-latest
+
+      - name: Tag deployed revision
+        run: |
+          gcloud run services update-traffic feature-flag-service \
+            --region=us-central1 \
+            --update-tags=stable=$(gcloud run services describe feature-flag-service \
+              --region=us-central1 \
+              --format='value(status.latestReadyRevisionName)')
