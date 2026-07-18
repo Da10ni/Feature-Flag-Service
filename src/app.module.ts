@@ -1,8 +1,13 @@
 import { Module, MiddlewareConsumer, NestModule } from '@nestjs/common';
-import { ConfigModule, ConfigService } from '@nestjs/config';
+import { APP_GUARD } from '@nestjs/core';
+import { ConfigModule } from '@nestjs/config';
 import { TypeOrmModule } from '@nestjs/typeorm';
+import { dataSourceOptions } from './database/data-source';
 import { ThrottlerModule } from '@nestjs/throttler';
 import { EventEmitterModule } from '@nestjs/event-emitter';
+import { TenantThrottlerGuard } from './common/guards/tenant-throttler.guard';
+import { MetricsModule } from './metrics/metrics.module';
+import { MetricsMiddleware } from './metrics/metrics.middleware';
 import { TenantsModule } from './tenants/tenants.module';
 import { FlagsModule } from './flags/flags.module';
 import { EvaluationModule } from './evaluation/evaluation.module';
@@ -11,31 +16,28 @@ import { SseModule } from './sse/sse.module';
 import { HealthModule } from './health/health.module';
 import { RedisModule } from './redis/redis.module';
 import { CorrelationIdMiddleware } from './common/middleware/correlation-id.middleware';
-import { Tenant } from './tenants/entities/tenant.entity';
-import { FeatureFlag } from './flags/entities/feature-flag.entity';
-import { FlagEnvironment } from './flags/entities/flag-environment.entity';
-import { AuditLog } from './audit/entities/audit-log.entity';
 
 @Module({
   imports: [
     ConfigModule.forRoot({ isGlobal: true }),
+    // Shares one definition with the TypeORM CLI (src/database/data-source.ts) so
+    // generated migrations always diff against the schema the app actually boots.
     TypeOrmModule.forRootAsync({
-      inject: [ConfigService],
-      useFactory: (config: ConfigService) => ({
-        type: 'postgres',
-        host: config.get('DB_HOST', 'localhost'),
-        port: config.get<number>('DB_PORT', 5432),
-        username: config.get('DB_USER', 'postgres'),
-        password: config.get('DB_PASSWORD', 'postgres'),
-        database: config.get('DB_NAME', 'featureflags'),
-        entities: [Tenant, FeatureFlag, FlagEnvironment, AuditLog],
-        synchronize: config.get('NODE_ENV') !== 'production',
-        logging: config.get('NODE_ENV') === 'development',
-        ssl: config.get('DB_SSL') === 'true' ? { rejectUnauthorized: false } : false,
-      }),
+      useFactory: () => dataSourceOptions(),
     }),
-    ThrottlerModule.forRoot([{ ttl: 60000, limit: 1000 }]),
+    // Per-tenant quota (see TenantThrottlerGuard). The default is ~100 rps sustained per
+    // tenant: flag evaluation sits on the request path of every client page load, so a
+    // limit low enough to be "safe" just breaks the callers it is meant to protect. The
+    // point here is noisy-neighbour containment, not a billing quota — one tenant's traffic
+    // spike must not starve the others.
+    ThrottlerModule.forRoot([
+      {
+        ttl: Number(process.env.THROTTLE_TTL_MS ?? 60_000),
+        limit: Number(process.env.THROTTLE_LIMIT ?? 6_000),
+      },
+    ]),
     EventEmitterModule.forRoot(),
+    MetricsModule,
     RedisModule,
     TenantsModule,
     FlagsModule,
@@ -44,9 +46,13 @@ import { AuditLog } from './audit/entities/audit-log.entity';
     SseModule,
     HealthModule,
   ],
+  providers: [{ provide: APP_GUARD, useClass: TenantThrottlerGuard }],
 })
 export class AppModule implements NestModule {
   configure(consumer: MiddlewareConsumer) {
-    consumer.apply(CorrelationIdMiddleware).forRoutes('*');
+    // Order matters: correlation ID first so it wraps the request in the ALS store that
+    // every subsequent log line reads from. Metrics second — as middleware it sees guard
+    // rejections and final status codes that an interceptor never would.
+    consumer.apply(CorrelationIdMiddleware, MetricsMiddleware).forRoutes('*');
   }
 }

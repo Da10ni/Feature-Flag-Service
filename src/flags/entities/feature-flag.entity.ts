@@ -1,4 +1,14 @@
-import { Entity, PrimaryGeneratedColumn, Column, CreateDateColumn, UpdateDateColumn, ManyToOne, OneToMany, JoinColumn, Index } from 'typeorm';
+import {
+  Entity,
+  PrimaryGeneratedColumn,
+  Column,
+  CreateDateColumn,
+  UpdateDateColumn,
+  ManyToOne,
+  OneToMany,
+  JoinColumn,
+  Index,
+} from 'typeorm';
 import { Tenant } from '../../tenants/entities/tenant.entity';
 import { FlagEnvironment } from './flag-environment.entity';
 
@@ -9,15 +19,18 @@ export enum FlagType {
 }
 
 @Entity('feature_flags')
-@Index(['tenantId', 'flagKey'], { unique: true })
+// Unique per tenant, not globally — two tenants may each own a flag called "new-checkout".
+@Index('IDX_feature_flags_tenant_key', ['tenantId', 'flagKey'], {
+  unique: true,
+})
 export class FeatureFlag {
   @PrimaryGeneratedColumn('uuid')
   id: string;
 
-  @Column({ name: 'tenant_id' })
+  @Column({ name: 'tenant_id', type: 'uuid' })
   tenantId: string;
 
-  @ManyToOne(() => Tenant, t => t.flags)
+  @ManyToOne(() => Tenant, (t) => t.flags, { onDelete: 'CASCADE' })
   @JoinColumn({ name: 'tenant_id' })
   tenant: Tenant;
 
@@ -39,7 +52,10 @@ export class FeatureFlag {
   @Column({ name: 'is_archived', default: false })
   isArchived: boolean;
 
-  @OneToMany(() => FlagEnvironment, env => env.flag, { cascade: true, eager: true })
+  @OneToMany(() => FlagEnvironment, (env) => env.flag, {
+    cascade: true,
+    eager: true,
+  })
   environments: FlagEnvironment[];
 
   @CreateDateColumn({ name: 'created_at' })

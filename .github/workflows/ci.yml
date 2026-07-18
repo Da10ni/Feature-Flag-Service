@@ -138,27 +138,42 @@ jobs:
       - name: Deploy to Cloud Run (Staging)
         uses: google-github-actions/deploy-cloudrun@v2
         with:
-          service: feature-flag-service
+          service: ${{ env.IMAGE_NAME }}-staging
           region: us-central1
           image: ${{ env.REGISTRY }}/${{ secrets.GCP_PROJECT_ID }}/${{ env.IMAGE_NAME }}/${{ env.IMAGE_NAME }}:${{ needs.build-and-push.outputs.short_sha }}
           flags: '--traffic-tag=canary --no-traffic'
 
-      - name: Smoke test new revision
+      - name: Smoke test canary revision
         run: |
-          CANARY_URL=$(gcloud run services describe feature-flag-service \
+          SERVICE=${{ env.IMAGE_NAME }}-staging
+          # The canary tag gives the new revision its own URL, isolated from live traffic,
+          # so this exercises the real revision without any user reaching it.
+          CANARY_URL=$(gcloud run services describe "$SERVICE" \
             --region=us-central1 \
-            --format='value(status.traffic[].url)' | head -1)
-          STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$CANARY_URL/api/v1/health")
+            --format='value(status.traffic.filter("tag:canary").extract("url"))' | tr -d "[]'")
+          if [ -z "$CANARY_URL" ]; then
+            echo "Could not resolve canary URL — refusing to promote"
+            exit 1
+          fi
+          echo "Probing $CANARY_URL/api/v1/health"
+          # /health returns 503 when Postgres is unreachable, so this catches a revision
+          # that boots but cannot serve.
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 "$CANARY_URL/api/v1/health")
           if [ "$STATUS" != "200" ]; then
-            echo "Health check failed with status $STATUS"
+            echo "Canary health check failed with status $STATUS — not promoting"
             exit 1
           fi
 
-      - name: Route 100% traffic to new revision (Staging)
+      - name: Promote canary to 100% traffic (Staging)
         run: |
-          gcloud run services update-traffic feature-flag-service \
+          SERVICE=${{ env.IMAGE_NAME }}-staging
+          NEW_REVISION=$(gcloud run services describe "$SERVICE" \
             --region=us-central1 \
-            --to-latest
+            --format='value(status.latestReadyRevisionName)')
+          gcloud run services update-traffic "$SERVICE" \
+            --region=us-central1 \
+            --to-revisions="$NEW_REVISION=100" \
+            --update-tags=stable=$NEW_REVISION
 
   deploy-production:
     name: Deploy to Production (Blue-Green)
@@ -179,44 +194,58 @@ jobs:
       - name: Deploy new revision (0% traffic — green)
         uses: google-github-actions/deploy-cloudrun@v2
         with:
-          service: feature-flag-service
+          service: ${{ env.IMAGE_NAME }}-production
           region: us-central1
           image: ${{ env.REGISTRY }}/${{ secrets.GCP_PROJECT_ID }}/${{ env.IMAGE_NAME }}/${{ env.IMAGE_NAME }}:${{ needs.build-and-push.outputs.short_sha }}
-          flags: '--no-traffic'
+          flags: '--no-traffic --tag=green'
 
-      - name: Canary: route 10% traffic to new revision
+      - name: Verify green revision before it takes any traffic
         run: |
-          NEW_REVISION=$(gcloud run services describe feature-flag-service \
+          SERVICE=${{ env.IMAGE_NAME }}-production
+          echo "SERVICE=$SERVICE" >> "$GITHUB_ENV"
+          NEW_REVISION=$(gcloud run services describe "$SERVICE" \
             --region=us-central1 \
             --format='value(status.latestCreatedRevisionName)')
-          gcloud run services update-traffic feature-flag-service \
+          echo "NEW_REVISION=$NEW_REVISION" >> "$GITHUB_ENV"
+          # Capture the currently-serving revision BEFORE shifting traffic — this is the
+          # rollback target, and it must be recorded while it is still the live one.
+          PREV_REVISION=$(gcloud run services describe "$SERVICE" \
             --region=us-central1 \
-            --to-revisions="$NEW_REVISION=10"
+            --format='value(status.traffic[0].revisionName)')
+          echo "PREV_REVISION=$PREV_REVISION" >> "$GITHUB_ENV"
 
-      - name: Wait and validate canary
-        run: |
-          sleep 60
-          ERROR_RATE=$(gcloud logging read \
-            'resource.type="cloud_run_revision" severity=ERROR' \
-            --limit=100 --format=json | python3 -c "import sys,json; logs=json.load(sys.stdin); print(len(logs))")
-          if [ "$ERROR_RATE" -gt "5" ]; then
-            echo "Too many errors during canary — rolling back"
-            gcloud run services update-traffic feature-flag-service \
-              --region=us-central1 \
-              --to-latest
+          GREEN_URL=$(gcloud run services describe "$SERVICE" \
+            --region=us-central1 \
+            --format='value(status.traffic.filter("tag:green").extract("url"))' | tr -d "[]'")
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 "$GREEN_URL/api/v1/health")
+          if [ "$STATUS" != "200" ]; then
+            echo "Green revision unhealthy ($STATUS) — no traffic shifted, nothing to roll back"
             exit 1
           fi
 
-      - name: Promote: route 100% traffic to new revision
+      - name: Canary — route 10% traffic to new revision
         run: |
-          gcloud run services update-traffic feature-flag-service \
+          gcloud run services update-traffic "$SERVICE" \
             --region=us-central1 \
-            --to-latest
+            --to-revisions="$NEW_REVISION=10,$PREV_REVISION=90"
 
-      - name: Tag deployed revision
+      - name: Validate canary — roll back on error spike
         run: |
-          gcloud run services update-traffic feature-flag-service \
-            --region=us-central1 \
-            --update-tags=stable=$(gcloud run services describe feature-flag-service \
+          sleep 60
+          ERROR_COUNT=$(gcloud logging read \
+            'resource.type="cloud_run_revision" resource.labels.revision_name="'"$NEW_REVISION"'" severity=ERROR' \
+            --freshness=2m --limit=100 --format=json | python3 -c "import sys,json; print(len(json.load(sys.stdin)))")
+          if [ "$ERROR_COUNT" -gt "5" ]; then
+            echo "Canary produced $ERROR_COUNT errors — rolling back to $PREV_REVISION"
+            gcloud run services update-traffic "$SERVICE" \
               --region=us-central1 \
-              --format='value(status.latestReadyRevisionName)')
+              --to-revisions="$PREV_REVISION=100"
+            exit 1
+          fi
+
+      - name: Promote — 100% traffic to new revision, tag stable
+        run: |
+          gcloud run services update-traffic "$SERVICE" \
+            --region=us-central1 \
+            --to-revisions="$NEW_REVISION=100" \
+            --update-tags=stable=$NEW_REVISION

@@ -1,4 +1,17 @@
-import { Controller, Get, Post, Put, Delete, Param, Body, Query, UseGuards, HttpCode, HttpStatus, Request } from '@nestjs/common';
+import {
+  Controller,
+  Get,
+  Post,
+  Put,
+  Delete,
+  Param,
+  Body,
+  Query,
+  UseGuards,
+  HttpCode,
+  HttpStatus,
+  ForbiddenException,
+} from '@nestjs/common';
 import { FlagsService } from './flags.service';
 import { CreateFlagDto } from './dto/create-flag.dto';
 import { UpdateFlagDto } from './dto/update-flag.dto';
@@ -17,7 +30,6 @@ export class FlagsController {
     @Param('tenantId') tenantId: string,
     @Body() dto: CreateFlagDto,
     @CurrentTenant() tenant: Tenant,
-    @Request() req: any,
   ) {
     this.validateTenantAccess(tenantId, tenant);
     return this.flagsService.create(tenantId, dto, tenant.id);
@@ -30,7 +42,7 @@ export class FlagsController {
     @Query('status') status?: string,
     @CurrentTenant() tenant?: Tenant,
   ) {
-    this.validateTenantAccess(tenantId, tenant);
+    this.validateTenantAccess(tenantId, tenant!);
     return this.flagsService.findAll(tenantId, environment, status);
   }
 
@@ -58,7 +70,7 @@ export class FlagsController {
 
   private validateTenantAccess(tenantId: string, tenant: Tenant) {
     if (tenant.id !== tenantId) {
-      throw new Error('Forbidden: cannot access another tenant\'s flags');
+      throw new ForbiddenException("Cannot access another tenant's flags");
     }
   }
 }

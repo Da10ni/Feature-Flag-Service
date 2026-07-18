@@ -5,3 +5,12 @@ coverage/
 .env.local
 *.log
 .DS_Store
+
+# Terraform: provider plugins and local state. State lives in the GCS backend — a committed
+# .tfstate would leak the generated DB password and admin API key in plaintext.
+**/.terraform/*
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log

@@ -8,7 +8,10 @@ import { FlagsController } from './flags.controller';
 import { TenantsModule } from '../tenants/tenants.module';
 
 @Module({
-  imports: [TypeOrmModule.forFeature([FeatureFlag, FlagEnvironment, AuditLog]), TenantsModule],
+  imports: [
+    TypeOrmModule.forFeature([FeatureFlag, FlagEnvironment, AuditLog]),
+    TenantsModule,
+  ],
   providers: [FlagsService],
   controllers: [FlagsController],
   exports: [FlagsService, TypeOrmModule],

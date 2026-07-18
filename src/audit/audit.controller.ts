@@ -1,4 +1,10 @@
-import { Controller, Get, Param, UseGuards } from '@nestjs/common';
+import {
+  Controller,
+  Get,
+  Param,
+  UseGuards,
+  ForbiddenException,
+} from '@nestjs/common';
 import { AuditService } from './audit.service';
 import { ApiKeyGuard } from '../common/guards/api-key.guard';
 import { CurrentTenant } from '../common/decorators/tenant.decorator';
@@ -15,7 +21,8 @@ export class AuditController {
     @Param('flagKey') flagKey: string,
     @CurrentTenant() tenant: Tenant,
   ) {
-    if (tenant.id !== tenantId) throw new Error('Forbidden');
+    if (tenant.id !== tenantId)
+      throw new ForbiddenException("Cannot access another tenant's history");
     return this.auditService.getHistory(tenantId, flagKey);
   }
 }

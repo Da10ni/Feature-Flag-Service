@@ -28,7 +28,14 @@ export default tseslint.config(
     rules: {
       '@typescript-eslint/no-explicit-any': 'off',
       '@typescript-eslint/no-floating-promises': 'warn',
+      // The no-unsafe-* family fires on inherently-untyped boundaries we don't own:
+      // Express `req`, supertest `res.body`, and jsonb columns typed `any`. Warn rather
+      // than error so lint still gates real problems instead of failing CI on framework noise.
       '@typescript-eslint/no-unsafe-argument': 'warn',
+      '@typescript-eslint/no-unsafe-assignment': 'warn',
+      '@typescript-eslint/no-unsafe-member-access': 'warn',
+      '@typescript-eslint/no-unsafe-call': 'warn',
+      '@typescript-eslint/no-unsafe-return': 'warn',
       "prettier/prettier": ["error", { endOfLine: "auto" }],
     },
   },

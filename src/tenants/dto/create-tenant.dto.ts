@@ -1,4 +1,10 @@
-import { IsString, IsNotEmpty, IsOptional, IsObject, Matches } from 'class-validator';
+import {
+  IsString,
+  IsNotEmpty,
+  IsOptional,
+  IsObject,
+  Matches,
+} from 'class-validator';
 
 export class CreateTenantDto {
   @IsString()
@@ -7,7 +13,9 @@ export class CreateTenantDto {
 
   @IsString()
   @IsNotEmpty()
-  @Matches(/^[a-z0-9-]+$/, { message: 'slug must be lowercase alphanumeric with hyphens' })
+  @Matches(/^[a-z0-9-]+$/, {
+    message: 'slug must be lowercase alphanumeric with hyphens',
+  })
   slug: string;
 
   @IsOptional()

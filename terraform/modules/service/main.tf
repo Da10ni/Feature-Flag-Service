@@ -1,0 +1,218 @@
+variable "name_prefix" { type = string }
+variable "short_prefix" {
+  type        = string
+  description = "Abbreviated prefix — service account account_id is capped at 30 characters."
+  validation {
+    condition     = length("${var.short_prefix}-sa") >= 6 && length("${var.short_prefix}-sa") <= 30
+    error_message = "Service account id '<short_prefix>-sa' must be between 6 and 30 characters."
+  }
+}
+variable "service_name" { type = string }
+variable "project_id" { type = string }
+variable "region" { type = string }
+variable "environment" { type = string }
+variable "image" { type = string }
+variable "connector_id" { type = string }
+variable "db_host" { type = string }
+variable "redis_host" { type = string }
+variable "redis_port" { type = number }
+variable "db_password_secret_id" { type = string }
+variable "db_password_secret_name" { type = string }
+variable "admin_key_secret_id" { type = string }
+variable "admin_key_secret_name" { type = string }
+variable "min_instances" { type = number }
+variable "max_instances" { type = number }
+
+locals {
+  is_production = var.environment == "production"
+}
+
+# --- Least-privilege identity -----------------------------------------------------------
+# A dedicated SA per environment: staging credentials can never reach the production
+# database, and the roles below are the complete set the service needs.
+resource "google_service_account" "run" {
+  # account_id is capped at 30 chars by GCP, so this uses the short prefix. The readable
+  # name still shows up in the console via display_name.
+  account_id   = "${var.short_prefix}-sa"
+  display_name = "${var.name_prefix} Cloud Run"
+}
+
+resource "google_project_iam_member" "sql_client" {
+  project = var.project_id
+  role    = "roles/cloudsql.client"
+  member  = "serviceAccount:${google_service_account.run.email}"
+}
+
+# Scoped to the individual secrets, not project-wide secretAccessor.
+resource "google_secret_manager_secret_iam_member" "db_password" {
+  secret_id = var.db_password_secret_name
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.run.email}"
+}
+
+resource "google_secret_manager_secret_iam_member" "admin_key" {
+  secret_id = var.admin_key_secret_name
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.run.email}"
+}
+
+# Lets the Managed Prometheus sidecar ship scraped custom metrics to Cloud Monitoring.
+resource "google_project_iam_member" "metric_writer" {
+  project = var.project_id
+  role    = "roles/monitoring.metricWriter"
+  member  = "serviceAccount:${google_service_account.run.email}"
+}
+
+resource "google_cloud_run_v2_service" "main" {
+  name     = var.service_name
+  location = var.region
+
+  template {
+    service_account = google_service_account.run.email
+
+    # Tells the GMP sidecar which endpoint on the app container to scrape.
+    annotations = {
+      "run.googleapis.com/gmp-config" = jsonencode({
+        scrape_configs = [{
+          job_name        = var.service_name
+          scrape_interval = "30s"
+          metrics_path    = "/api/v1/metrics"
+          static_configs  = [{ targets = ["localhost:3000"] }]
+        }]
+      })
+    }
+
+    # Production keeps warm instances: a cold start pays Nest bootstrap plus the migration
+    # lock check, which is far too slow for a latency-sensitive evaluation endpoint.
+    scaling {
+      min_instance_count = var.min_instances
+      max_instance_count = var.max_instances
+    }
+
+    vpc_access {
+      connector = var.connector_id
+      egress    = "PRIVATE_RANGES_ONLY"
+    }
+
+    containers {
+      name  = "app"
+      image = var.image
+
+      ports { container_port = 3000 }
+
+      resources {
+        limits = {
+          cpu    = local.is_production ? "2" : "1"
+          memory = "512Mi"
+        }
+      }
+
+      env {
+        name  = "NODE_ENV"
+        value = var.environment
+      }
+      env {
+        name  = "DB_HOST"
+        value = var.db_host
+      }
+      env {
+        name  = "DB_PORT"
+        value = "5432"
+      }
+      env {
+        name  = "DB_USER"
+        value = "appuser"
+      }
+      env {
+        name  = "DB_NAME"
+        value = "featureflags"
+      }
+      env {
+        name  = "DB_SSL"
+        value = "true"
+      }
+      env {
+        name  = "REDIS_HOST"
+        value = var.redis_host
+      }
+      env {
+        name  = "REDIS_PORT"
+        value = tostring(var.redis_port)
+      }
+
+      # Secrets are mounted from Secret Manager, never inlined as plaintext env values.
+      env {
+        name = "DB_PASSWORD"
+        value_source {
+          secret_key_ref {
+            secret  = var.db_password_secret_id
+            version = "latest"
+          }
+        }
+      }
+      env {
+        name = "ADMIN_API_KEY"
+        value_source {
+          secret_key_ref {
+            secret  = var.admin_key_secret_id
+            version = "latest"
+          }
+        }
+      }
+
+      # /health returns 503 when Postgres is unreachable, so these probes and the canary
+      # gate in CI all fail closed on a broken dependency rather than serving errors.
+      startup_probe {
+        http_get {
+          path = "/api/v1/health"
+          port = 3000
+        }
+        initial_delay_seconds = 10
+        period_seconds        = 5
+        failure_threshold     = 10
+      }
+
+      liveness_probe {
+        http_get {
+          path = "/api/v1/health"
+          port = 3000
+        }
+        initial_delay_seconds = 30
+        period_seconds        = 10
+        failure_threshold     = 3
+      }
+    }
+
+    # Managed Service for Prometheus sidecar — scrapes /api/v1/metrics and forwards the
+    # custom metrics (eval latency, cache hit ratio, per-tenant rates) to Cloud Monitoring.
+    containers {
+      name  = "collector"
+      image = "us-docker.pkg.dev/cloud-ops-agents-artifacts/cloud-run-gmp-sidecar/cloud-run-gmp-sidecar:1.1.1"
+    }
+  }
+
+  traffic {
+    type    = "TRAFFIC_TARGET_ALLOCATION_TYPE_LATEST"
+    percent = 100
+  }
+
+  # Traffic split and image tag are owned by the deploy pipeline. Without this, any
+  # `terraform apply` during a canary would yank 100% of traffic to the newest revision
+  # and silently undo the rollout.
+  lifecycle {
+    ignore_changes = [
+      traffic,
+      template[0].containers[0].image,
+    ]
+  }
+}
+
+resource "google_cloud_run_v2_service_iam_member" "public" {
+  location = google_cloud_run_v2_service.main.location
+  name     = google_cloud_run_v2_service.main.name
+  role     = "roles/run.invoker"
+  member   = "allUsers"
+}
+
+output "url" { value = google_cloud_run_v2_service.main.uri }
+output "service_account_email" { value = google_service_account.run.email }

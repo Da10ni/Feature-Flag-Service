@@ -1,4 +1,11 @@
-import { Entity, PrimaryGeneratedColumn, Column, ManyToOne, JoinColumn, Index } from 'typeorm';
+import {
+  Entity,
+  PrimaryGeneratedColumn,
+  Column,
+  ManyToOne,
+  JoinColumn,
+  Index,
+} from 'typeorm';
 import { FeatureFlag } from './feature-flag.entity';
 
 export enum Environment {
@@ -8,15 +15,17 @@ export enum Environment {
 }
 
 @Entity('flag_environments')
-@Index(['flagId', 'environment'], { unique: true })
+@Index('IDX_flag_environments_flag_env', ['flagId', 'environment'], {
+  unique: true,
+})
 export class FlagEnvironment {
   @PrimaryGeneratedColumn('uuid')
   id: string;
 
-  @Column({ name: 'flag_id' })
+  @Column({ name: 'flag_id', type: 'uuid' })
   flagId: string;
 
-  @ManyToOne(() => FeatureFlag, f => f.environments)
+  @ManyToOne(() => FeatureFlag, (f) => f.environments, { onDelete: 'CASCADE' })
   @JoinColumn({ name: 'flag_id' })
   flag: FeatureFlag;
 

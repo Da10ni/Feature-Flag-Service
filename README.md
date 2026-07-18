@@ -46,11 +46,12 @@ Each tenant (an organization or product team) receives an isolated namespace and
 | Per-environment config | Each flag has independent `isEnabled`, `rolloutPercentage`, and `variants` per environment |
 | Percentage rollout | SHA-256 consistent hashing ensures the same user always lands in the same bucket |
 | Variant / A/B testing | Weighted variant selection on string flags using the same hash bucket |
-| Redis caching | Evaluation results are cached for 30 seconds to reduce database load |
+| Redis caching | Evaluation results are cached for 30 seconds; cache is invalidated on any flag update/archive |
 | Audit logging | Every create, update, and archive action is recorded with before/after state |
 | Real-time SSE | Clients can subscribe to a live stream of flag changes without polling |
-| Rate limiting | 1 000 requests per minute per IP via `@nestjs/throttler` |
-| Structured logging | All log output is JSON for ingestion into Cloud Logging |
+| Rate limiting | 1 000 requests per minute per tenant (by API key, IP fallback) via a global `ThrottlerGuard` |
+| Custom metrics | Prometheus metrics at `/api/v1/metrics`: eval latency, evals/sec by tenant, error rate by tenant+endpoint, cache hit/miss — scraped into Cloud Monitoring via a GMP sidecar |
+| Structured logging | All log output is JSON with a per-request `correlationId` (via AsyncLocalStorage) for Cloud Logging |
 | Health endpoint | `/api/v1/health` used by Cloud Run startup and liveness probes |
 
 ---
@@ -116,35 +117,38 @@ Each tenant (an organization or product team) receives an isolated namespace and
 
 **Cross-Cutting Concerns**
 
-- `ApiKeyGuard` — Validates the `x-api-key` header by bcrypt-comparing against all active tenant hashes. Attaches the resolved tenant to the request.
-- `CorrelationIdMiddleware` — Propagates or generates an `X-Correlation-ID` header on every request for distributed tracing.
-- `JsonLogger` — Replaces NestJS's default logger with structured JSON output compatible with Cloud Logging.
-- `ThrottlerModule` — Rate-limits to 1 000 requests per minute.
+- `ApiKeyGuard` — Validates the `x-api-key` header. An indexed SHA-256 lookup narrows to a single tenant, then one bcrypt verify confirms the key (O(1), not a bcrypt compare against every tenant). Attaches the resolved tenant to the request. Applied to flags, audit, evaluation, and SSE controllers.
+- `CorrelationIdMiddleware` — Propagates or generates an `X-Correlation-ID` header on every request and stores it in an AsyncLocalStorage context so `JsonLogger` stamps every log line with it.
+- `JsonLogger` — Replaces NestJS's default logger with structured JSON output (including `correlationId`) compatible with Cloud Logging.
+- `TenantThrottlerGuard` — Global guard rate-limiting 1 000 req/min keyed per tenant (API key), falling back to IP for unauthenticated routes.
+- `MetricsInterceptor` — Records HTTP latency and status (→ error rate) per tenant and route for every request into the Prometheus registry exposed at `/api/v1/metrics`.
 - `ValidationPipe` — Validates and transforms all incoming DTOs using `class-validator`; strips unknown fields (`whitelist: true`).
 
 ### Data Flow — Single Flag Evaluation
 
 ```
-1. Client sends POST /api/v1/evaluate
-   Body: { tenantId, environment, userId, flagKey }
+1. Client sends POST /api/v1/evaluate  (header: x-api-key)
+   Body: { tenant_id?, environment, user_id, flag_key }
 
-2. EvaluationController delegates to EvaluationService.evaluate()
+2. ApiKeyGuard resolves the tenant from the key
+   Indexed SHA-256 lookup --> one bcrypt verify --> memoised 60 s
+   A tenant_id in the body is only cross-checked, never trusted (403 on mismatch)
 
-3. EvaluationService checks Redis:
-   Key = eval:{tenantId}:{environment}:{flagKey}:{userId}
-   --> HIT: return cached result with reason=CACHED
+3. EvaluationController delegates to EvaluationService.evaluate()
 
-4. MISS: query PostgreSQL for FeatureFlag WHERE tenantId = ? AND flagKey = ?
-   with eager-loaded FlagEnvironment rows
+4. EvaluationService loads this tenant's flag DEFINITIONS from Redis:
+   Key = flags:{tenantId}:{environment}
+   --> HIT (the common case): parse and continue, no database access
 
-5. Find the FlagEnvironment row matching the requested environment
+5. MISS only: one query for the tenant's active flags in this environment,
+   with eager-loaded FlagEnvironment rows; cache the set (TTL 60 s)
 
-6. Run evaluation algorithm (see Section 6)
+6. Run the evaluation algorithm in memory (see Section 6) — pure CPU, no I/O
 
-7. Cache the result in Redis (TTL 30 s)
-
-8. Return EvaluationResult { flagKey, value, reason }
+7. Return EvaluationResult { flagKey, value, reason }
 ```
+
+Bulk evaluation is the same path: step 4 loads the set once, then step 6 runs per flag in memory. It costs no more round trips than a single evaluation.
 
 ---
 
@@ -172,12 +176,27 @@ PostgreSQL is the primary store of record for all tenant, flag, and audit data.
 
 ### Redis (via ioredis)
 
-Flag evaluation is a read-heavy, latency-sensitive operation. Redis serves as a short-lived cache layer:
+Flag evaluation is a read-heavy, latency-sensitive operation. Redis caches **flag definitions**, not evaluation results — this is the single most important decision in the data path, so it is worth explaining why.
 
-- **30-second TTL** per evaluation result key means that after a flag change, staleness resolves within half a minute — an acceptable trade-off between freshness and database load.
-- **ioredis** with `enableOfflineQueue: false` means Redis failures are silent: if Redis is down the service falls through to PostgreSQL rather than returning errors to callers. This makes Redis entirely optional for correctness.
-- **Cache key structure** (`eval:{tenantId}:{environment}:{flagKey}:{userId}`) is scoped so that invalidation on a flag update can target a pattern like `eval:{tenantId}:*:{flagKey}:*`, preventing cross-tenant or cross-environment cache pollution.
-- **GCP Memorystore** provides a managed, VPC-private Redis 7 instance, eliminating the need to manage Redis persistence, auth, or networking manually.
+**What we cache, and why not the obvious thing.** The intuitive design is to cache the evaluated result per user: key on `{tenant, env, flagKey, userId}`, store the answer. It performs badly in practice. The hit rate of such a cache equals the rate at which the *same user* recurs within the TTL, and this service is called once per end-user request across a large user population — so the hit rate tends toward zero. Nearly every request pays a Redis round trip *and* falls through to a joined PostgreSQL query. The cache costs latency without saving any. Invalidating a single flag also means finding every user's key for it, which in Redis means `KEYS`/`SCAN` over the keyspace.
+
+Flag definitions invert every one of those properties:
+
+| | Per-user results | Flag definitions (chosen) |
+|---|---|---|
+| Cardinality | tenants × envs × flags × **users** | tenants × envs |
+| Hit rate | ≈ user recurrence (near zero) | ≈ 100%, independent of user count |
+| Invalidation | scan for every user's key | one `DEL` per environment |
+| DB reads under load | one per cache miss | one per tenant per TTL |
+
+One cached entry serves every user of that tenant. Evaluation itself is then pure CPU — a SHA-256 hash and a comparison, microseconds — so there is nothing left worth caching.
+
+Measured effect (details in Section 11): median evaluation latency fell from **47 ms to 7 ms** and sustained throughput rose from **347 to 590 req/s**, because the database left the hot path almost entirely.
+
+- **Cache key** is `flags:{tenantId}:{environment}` — scoped so one tenant's flags can never be served to another, and one environment's config can never leak into another.
+- **Writes invalidate explicitly.** Create, update, and archive each delete the affected tenant's keys, so a flag change is visible on the very next request rather than after a TTL. The 60-second TTL is a backstop for a lost invalidation, not the freshness mechanism.
+- **Redis is optional for correctness.** Every Redis call is wrapped so failures fall through to PostgreSQL instead of erroring. A Redis outage degrades latency, never availability.
+- **GCP Memorystore** provides a managed, VPC-private Redis 7 instance — no persistence, auth, or networking to manage. Production uses `STANDARD_HA` so a node failure doesn't dump the entire cache onto PostgreSQL at once.
 
 ### Google Cloud Run
 
@@ -195,8 +214,8 @@ All GCP infrastructure is declared in Terraform HCL rather than created via the 
 
 - **Reproducibility** — any engineer can provision an identical staging environment with `terraform apply`.
 - **Drift detection** — `terraform plan` in CI reveals if the live infrastructure diverges from the declared state.
-- **GCS backend** (`feature-flag-service-tfstate`) stores state remotely so multiple team members and CI pipelines share a single source of truth without conflicts.
-- **Environment parameterization** via `variables.tf` means the same configuration drives `development`, `staging`, and `production` with different tiers, availability types, and deletion-protection settings.
+- **GCS backend** (`feature-flag-service-tfstate`) stores state remotely so multiple team members and CI pipelines share a single source of truth without conflicts. Each environment uses a **separate state prefix**, so a staging apply can never mutate production resources.
+- **Composition module** — both environments instantiate the same `modules/environment`, so they are guaranteed to have identical shape and differ only where they should: machine tier, scaling bounds, subnet CIDR, alert thresholds. Adding a resource adds it to every environment, which is what stops staging and production drifting apart.
 
 ### GitHub Actions
 
@@ -317,7 +336,7 @@ INDEX: (tenant_id, flag_key)
 
 All endpoints are prefixed with `/api/v1`. Requests and responses use `Content-Type: application/json`.
 
-**Authentication:** Endpoints under `/tenants/:tenantId/flags` and `/tenants/:tenantId/flags/:flagKey/history` require an `x-api-key` header containing the raw API key issued at tenant creation. The Evaluation and SSE endpoints are unauthenticated by design (the `tenantId` in the body scopes the query; see Section 12 for the trade-off discussion).
+**Authentication:** Every endpoint except `POST /tenants` (tenant registration) requires an `x-api-key` header containing the raw API key issued at tenant creation — flags, audit history, evaluation, and SSE. The authenticated key resolves the tenant server-side; the evaluation and SSE endpoints derive `tenantId` from the key, never from the request body or query, which is what enforces tenant isolation on those surfaces. A key belonging to a different tenant than the `:tenantId` in a path returns `403 Forbidden`.
 
 ---
 
@@ -375,30 +394,18 @@ Provisions a new tenant. Returns the plaintext API key **once only** — it is n
 
 ---
 
-#### `GET /api/v1/tenants`
+**Authentication.** When `ADMIN_API_KEY` is set, this endpoint requires an `x-admin-key` header. Tenant registration mints an API key, so on a public URL an open endpoint lets anyone provision themselves credentials. The guard is a no-op when the variable is unset, so local development, Docker Compose, and CI need no extra configuration; Terraform generates a value and injects it from Secret Manager in staging and production.
 
-Returns all tenants (admin endpoint; no auth in current implementation).
-
-**Response `200 OK`:**
-```json
-[
-  {
-    "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
-    "name": "Acme Corporation",
-    "slug": "acme-corp",
-    "isActive": true,
-    "metadata": {},
-    "createdAt": "2026-07-18T12:00:00.000Z",
-    "updatedAt": "2026-07-18T12:00:00.000Z"
-  }
-]
+```bash
+gcloud secrets versions access latest \
+  --secret=feature-flag-service-production-admin-api-key
 ```
 
 ---
 
-#### `GET /api/v1/tenants/:id`
+#### `GET /api/v1/tenants/me`
 
-Returns a single tenant by UUID.
+Returns the tenant that owns the presented API key. Requires `x-api-key`.
 
 **Response `200 OK`:**
 ```json
@@ -412,6 +419,8 @@ Returns a single tenant by UUID.
   "updatedAt": "2026-07-18T12:00:00.000Z"
 }
 ```
+
+There is deliberately **no "list all tenants" endpoint**. The spec does not ask for one, and on a public URL it would enumerate every tenant on the platform. `apiKeyHash` and `apiKeyLookup` are additionally marked `select: false` on the entity, so credential material is excluded from every ordinary query and cannot be serialized into a response by accident — the auth guard opts back in explicitly and strips the hash before the request proceeds.
 
 ---
 
@@ -589,7 +598,7 @@ Archives a flag (soft delete). The flag is excluded from future evaluations and 
 
 ### Evaluation
 
-Evaluation endpoints are public (no API key required). The `tenantId` in the request body scopes the query.
+All evaluation endpoints require `x-api-key`.
 
 ---
 
@@ -597,13 +606,17 @@ Evaluation endpoints are public (no API key required). The `tenantId` in the req
 
 Evaluates a single named flag for a given user in a given environment.
 
+**Auth and tenant scoping.** The tenant is always derived from the API key. `tenant_id` *is* accepted in the body — the specification documents it there — but it is only ever cross-checked against the authenticated key and returns `403` on mismatch. It is never trusted as the source of tenant identity, so a caller cannot read another tenant's flags by changing a field in the payload.
+
+**Field naming.** Both the snake_case form documented in the spec (`tenant_id`, `user_id`, `flag_key`) and camelCase (`userId`, `flagKey`) are accepted, so either client convention works.
+
 **Request body:**
 ```json
 {
-  "tenantId": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "tenant_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
   "environment": "production",
-  "userId": "user-7a3f9b",
-  "flagKey": "new-checkout-flow",
+  "user_id": "user-7a3f9b",
+  "flag_key": "new-checkout-flow",
   "context": {
     "country": "US",
     "plan": "enterprise"
@@ -620,24 +633,25 @@ Evaluates a single named flag for a given user in a given environment.
 }
 ```
 
-**Response `200 OK` (result served from Redis):**
-```json
-{
-  "flagKey": "new-checkout-flow",
-  "value": true,
-  "reason": "CACHED"
-}
-```
-
 **Possible `reason` values:**
 
 | Reason | Description |
 |---|---|
 | `ENABLED` | Flag is on and user is within rollout; no variants |
-| `CACHED` | Result was served from Redis cache |
 | `FLAG_DISABLED` | The flag's `isEnabled` is `false` for this environment |
 | `NOT_IN_ROLLOUT` | Flag is enabled but user's hash bucket falls outside `rolloutPercentage` |
 | `VARIANT_MATCH` | A string flag variant was selected via weighted bucket assignment |
+
+`reason` always states *why* the flag evaluated the way it did. There is no `CACHED` reason: because the cache holds flag definitions rather than results, a cache hit does not change the answer or obscure its cause — which is what makes the field useful for debugging a rollout.
+
+**Error `400 Bad Request`** — an unrecognised environment is rejected rather than silently treated as "no config found", which would misleadingly report every flag as disabled:
+```json
+{
+  "statusCode": 400,
+  "message": ["environment must be one of the following values: development, staging, production"],
+  "error": "Bad Request"
+}
+```
 
 **Error `404 Not Found`:**
 ```json
@@ -654,10 +668,11 @@ Evaluates a single named flag for a given user in a given environment.
 
 Evaluates all active flags for a tenant in a single request. Useful for SDK initialisation.
 
+**Auth:** `x-api-key` required. Tenant is derived from the API key, not the body.
+
 **Request body:**
 ```json
 {
-  "tenantId": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
   "environment": "production",
   "userId": "user-7a3f9b"
 }
@@ -766,26 +781,27 @@ The evaluation engine is the performance-critical core of the service. It must b
 ```
 evaluate(tenantId, environment, userId, flagKey)
   |
-  +--> Check Redis cache
-  |      HIT  --> return cached result (reason = CACHED)
-  |      MISS --> continue
+  +--> Load this tenant's flag DEFINITIONS for this environment
+  |      Redis key flags:{tenantId}:{environment}
+  |        HIT  --> use the cached set (no database access)
+  |        MISS --> one query, then cache the set (TTL 60 s)
+  |      Flag not in the set --> throw NotFoundException
   |
-  +--> Load FeatureFlag from PostgreSQL
-  |      WHERE tenantId = ? AND flagKey = ? AND isArchived = false
-  |      NOT FOUND --> throw NotFoundException
-  |
-  +--> Find FlagEnvironment for the requested environment
+  |    ---- everything below is pure CPU: no I/O, no clock, no randomness ----
   |
   +--> Is envConfig.isEnabled == false?
   |      YES --> return { value: flag.defaultValue, reason: FLAG_DISABLED }
   |
   +--> Is envConfig.rolloutPercentage < 100?
-  |      YES --> compute bucket = SHA256_hash(flagKey, userId) % 100
+  |      YES --> bucket = SHA256("rollout" : flagKey : userId) % 100
   |             bucket >= rolloutPercentage?
   |               YES --> return { value: flag.defaultValue, reason: NOT_IN_ROLLOUT }
   |
   +--> Is flag.type == STRING and envConfig.variants is non-empty?
-  |      YES --> compute bucket = SHA256_hash(flagKey, userId) % 100
+  |      YES --> bucket = SHA256("variant" : flagKey : userId) % 100
+  |             ^^^^^^^^^ different salt, so this draw is INDEPENDENT of the
+  |             rollout gate above. Sharing one bucket would hand every
+  |             gated-in user the first variant. See "Why the salt" below.
   |             walk variants accumulating cumulative weights
   |             first variant where bucket < cumulative
   |               --> return { value: variant.value, reason: VARIANT_MATCH }
@@ -796,10 +812,10 @@ evaluate(tenantId, environment, userId, flagKey)
 ### SHA-256 Consistent Hashing
 
 ```typescript
-private computeHash(flagKey: string, userId: string): number {
-  // Concatenate flagKey and userId with a separator to prevent
-  // collisions like flagKey="ab", userId="c" vs flagKey="a", userId="bc"
-  const input = `${flagKey}:${userId}`;
+private computeHash(salt: string, flagKey: string, userId: string): number {
+  // salt separates INDEPENDENT decisions about the same user and flag.
+  // Separator prevents collisions like flagKey="ab", userId="c" vs "a", "bc".
+  const input = `${salt}:${flagKey}:${userId}`;
 
   // SHA-256 produces a 256-bit (64 hex character) digest
   const digest = createHash('sha256').update(input).digest('hex');
@@ -815,62 +831,79 @@ private computeHash(flagKey: string, userId: string): number {
 
 **Why SHA-256?**
 - Cryptographically uniform distribution ensures the 100 buckets are evenly populated across arbitrary user IDs (numeric, UUIDs, email addresses, etc.).
-- Deterministic: given the same inputs, it always produces the same digest, so a user's bucket assignment never changes unless the flag key or user ID changes.
+- Deterministic: given the same inputs, it always produces the same digest, so a user's bucket assignment never changes unless the inputs change.
 - The `flagKey` is part of the hash input so user `u1` can be in bucket 23 for `flag-A` and bucket 71 for `flag-B`. Without this, all flags would grant or deny the same population of users.
+
+**Why the salt — the subtle part.** Rollout gating and variant selection are two *separate* decisions about the same `(flag, user)` pair. If both draw from one hash, they are perfectly correlated, and the correlation silently destroys the experiment:
+
+> A flag at 50% rollout with a 50/50 control/treatment split. Gating admits users whose bucket is `< 50`. Variant selection then assigns `control` to buckets `< 50` and `treatment` to `50–99`. But *every* user who survived the gate has a bucket `< 50` by construction — so **100% receive `control` and 0% ever receive `treatment`.** Both endpoints return `200`, the rollout percentage is honoured exactly, and the A/B test simply never runs.
+
+Salting with `'rollout'` and `'variant'` makes the two draws independent, so the variant split holds inside any rollout percentage. Because the salts are fixed strings, determinism is preserved: a user's assignment still never changes.
+
+This is covered by a regression test (`splits variants evenly among users inside a partial rollout`) and verified end-to-end — 400 users against a 50%-rollout flag with a 50/50 split produce ≈204 gated out, ≈97 `control`, ≈99 `treatment`.
+
+A second property the salt buys: changing variant weights does not reshuffle *who is in the rollout*, because rollout membership is derived from a different digest entirely.
 
 ### Pseudocode
 
 ```
-FUNCTION evaluate(tenantId, environment, userId, flagKey):
-
-  // Step 1: Cache check
-  cacheKey <- "eval:" + tenantId + ":" + environment + ":" + flagKey + ":" + userId
+// I/O happens once, up front: load this tenant's flag set for this environment.
+// Everything after it is pure CPU, which is why bulk evaluation costs no extra round trips.
+FUNCTION loadFlags(tenantId, environment):
+  cacheKey <- "flags:" + tenantId + ":" + environment
   cached <- redis.GET(cacheKey)
   IF cached IS NOT NULL:
-    RETURN parse(cached) WITH reason = "CACHED"
+    RETURN parse(cached)                          // hit: serves every user of this tenant
 
-  // Step 2: Load flag
-  flag <- db.query(
-    "SELECT * FROM feature_flags
-     WHERE tenant_id = ? AND flag_key = ? AND is_archived = false",
-    [tenantId, flagKey]
+  flags <- db.query(
+    "SELECT * FROM feature_flags f
+     JOIN flag_environments e ON e.flag_id = f.id
+     WHERE f.tenant_id = ? AND f.is_archived = false AND e.environment = ?",
+    [tenantId, environment]
   )
+  redis.SETEX(cacheKey, 60, serialize(flags))     // TTL is a backstop; writes invalidate
+  RETURN flags
+
+
+FUNCTION evaluate(tenantId, environment, userId, flagKey):
+  flags <- loadFlags(tenantId, environment)
+  flag  <- flags.find(f -> f.flagKey == flagKey)
   IF flag IS NULL:
     RAISE NotFoundException
+  RETURN evaluateFlag(flag, flag.environments[0], userId)
 
-  // Step 3: Find environment config
-  envConfig <- flag.environments.find(e -> e.environment == environment)
 
-  // Step 4: Disabled check
+FUNCTION evaluateBulk(tenantId, environment, userId):
+  flags <- loadFlags(tenantId, environment)       // ONE lookup for the whole set
+  RETURN flags.map(f -> evaluateFlag(f, f.environments[0], userId))
+
+
+// Pure function: no I/O, no clock, no randomness. Same inputs -> same output, always.
+FUNCTION evaluateFlag(flag, envConfig, userId):
+
+  // Step 1: Disabled check
   IF envConfig IS NULL OR envConfig.isEnabled == false:
-    result <- { flagKey, value: flag.defaultValue, reason: "FLAG_DISABLED" }
-    redis.SETEX(cacheKey, 30, serialize(result))
-    RETURN result
+    RETURN { flagKey, value: flag.defaultValue, reason: "FLAG_DISABLED" }
 
-  // Step 5: Rollout check
+  // Step 2: Rollout gate — salted 'rollout'
   IF envConfig.rolloutPercentage < 100:
-    bucket <- SHA256(flagKey + ":" + userId) AS 32-bit integer % 100
+    bucket <- SHA256("rollout:" + flagKey + ":" + userId) AS 32-bit integer % 100
     IF bucket >= envConfig.rolloutPercentage:
-      result <- { flagKey, value: flag.defaultValue, reason: "NOT_IN_ROLLOUT" }
-      redis.SETEX(cacheKey, 30, serialize(result))
-      RETURN result
+      RETURN { flagKey, value: flag.defaultValue, reason: "NOT_IN_ROLLOUT" }
 
-  // Step 6: Variant selection (A/B test)
+  // Step 3: Variant selection — salted 'variant', so this draw is INDEPENDENT of Step 2.
+  // Reusing the rollout bucket here would hand every gated-in user the first variant.
   IF flag.type == "string" AND envConfig.variants IS NOT EMPTY:
-    bucket <- SHA256(flagKey + ":" + userId) AS 32-bit integer % 100
+    bucket <- SHA256("variant:" + flagKey + ":" + userId) AS 32-bit integer % 100
     cumulative <- 0
     FOR EACH variant IN envConfig.variants:
       cumulative <- cumulative + variant.weight
       IF bucket < cumulative:
-        result <- { flagKey, value: variant.value, reason: "VARIANT_MATCH" }
-        redis.SETEX(cacheKey, 30, serialize(result))
-        RETURN result
+        RETURN { flagKey, value: variant.value, reason: "VARIANT_MATCH" }
 
-  // Step 7: Default enabled
+  // Step 4: Default enabled
   resolvedValue <- (flag.type == "boolean") ? true : flag.defaultValue
-  result <- { flagKey, value: resolvedValue, reason: "ENABLED" }
-  redis.SETEX(cacheKey, 30, serialize(result))
-  RETURN result
+  RETURN { flagKey, value: resolvedValue, reason: "ENABLED" }
 ```
 
 ### Variant Selection Example
@@ -908,21 +941,48 @@ The same user will always receive `"control"` regardless of when or how many tim
 |---|---|
 | **Cloud Run** | Hosts the NestJS API; serverless, auto-scaling, traffic-splitting |
 | **Cloud SQL (PostgreSQL 16)** | Primary relational store; private VPC, automated backups |
-| **Memorystore (Redis 7)** | Evaluation result cache; VPC-private, no public IP |
-| **Artifact Registry** | Docker image storage; source for Cloud Run deployments |
-| **Secret Manager** | Stores the database password; injected into Cloud Run at startup |
-| **VPC Network + Subnet** | Private network (`10.0.0.0/24`) isolating all data services |
+| **Memorystore (Redis 7)** | Flag-definition cache; VPC-private, no public IP |
+| **Artifact Registry** | Docker image storage; **shared** across environments |
+| **Secret Manager** | Database password and admin API key; injected into Cloud Run at startup |
+| **VPC Network + Subnet** | Private network per environment, isolating all data services |
 | **VPC Access Connector** | Bridge allowing Cloud Run to reach Cloud SQL and Memorystore |
 | **Private Service Networking** | VPC peering for Cloud SQL private IP |
-| **Cloud Monitoring** | Alert policies for error rate > 5% and p95 latency > 1 s |
-| **GCS (Terraform backend)** | Stores Terraform state file (`feature-flag-service-tfstate`) |
+| **Managed Service for Prometheus** | Sidecar scrapes `/api/v1/metrics`, forwards custom metrics |
+| **Cloud Monitoring** | Dashboard, uptime check, and alert policies |
+| **GCS (Terraform backend)** | Terraform state, **one prefix per environment** |
 
-### VPC Layout
+### Terraform Layout
 
 ```
-VPC: feature-flag-service-vpc
+terraform/
+├── shared/                  # applied ONCE — resources common to all environments
+│   └── main.tf              #   Artifact Registry
+├── modules/
+│   ├── environment/         # composition module: one complete environment
+│   ├── network/             #   VPC, subnet, connector, private service access
+│   ├── data/                #   Cloud SQL, Memorystore, Secret Manager
+│   ├── service/             #   service account + IAM, Cloud Run, GMP sidecar
+│   └── observability/       #   dashboard, uptime check, alert policies
+└── envs/
+    ├── staging/             # root module — state prefix terraform/state/staging
+    └── production/          # root module — state prefix terraform/state/production
+```
+
+**Environment separation** is structural, not conventional:
+
+- **Separate state prefixes.** A staging `apply` physically cannot mutate production resources, because it never reads production state.
+- **Environment-suffixed resource names.** Every resource is `feature-flag-service-<environment>-*`, so both environments coexist in one GCP project without collision.
+- **Non-overlapping CIDRs.** Staging uses `10.10.0.0/24`, production `10.20.0.0/24`.
+- **Separate service accounts and databases.** Staging credentials cannot reach production data.
+- **One shared Artifact Registry.** Deliberately *not* per-environment: the image validated in staging must be the exact image promoted to production. A per-environment registry forces a rebuild between the two, and a rebuild is a different artifact — which defeats the purpose of having a staging environment.
+
+### VPC Layout (per environment)
+
+```
+VPC: feature-flag-service-<env>-vpc
 |
-+-- Subnet: feature-flag-service-subnet (10.0.0.0/24)
++-- Subnet: feature-flag-service-<env>-subnet
+|     |     (staging 10.10.0.0/24 | production 10.20.0.0/24)
 |     |
 |     +-- VPC Access Connector (200-1000 Mbps throughput)
 |     |     |
@@ -940,31 +1000,113 @@ All database traffic traverses private IP ranges inside GCP's network fabric. Th
 
 ### Secrets Management
 
-Database credentials flow as follows:
+Two secrets are managed, and neither is ever typed by a human:
 
-1. Terraform generates a 32-character random password via `random_password`.
-2. The password is stored in **Secret Manager** as `feature-flag-service-db-password`.
-3. The Cloud Run service account is granted `roles/secretmanager.secretAccessor` on that secret.
-4. The Cloud Run container template references the secret via `value_source.secret_key_ref` — GCP injects it as an environment variable at container startup.
-5. The application reads it via `process.env.DB_PASSWORD` through NestJS `ConfigService`.
+1. Terraform **generates** the value (`random_password`) — a 32-character database password and a 40-character admin API key. Because they are generated inside the apply, the plaintext never exists on a developer's machine or in a tfvars file.
+2. The value is stored in **Secret Manager** as `feature-flag-service-<env>-db-password` / `-admin-api-key`.
+3. The Cloud Run service account is granted `roles/secretmanager.secretAccessor` **on those individual secrets** — not project-wide, so the service can read exactly the two secrets it needs and no others.
+4. The container template references them via `value_source.secret_key_ref`; GCP injects them at container start.
+5. The application reads `process.env.DB_PASSWORD` and `ADMIN_API_KEY`.
 
-No secrets ever appear in source code, Terraform outputs, or GitHub Actions logs.
+No secret appears in source code, tfvars, Terraform outputs, or GitHub Actions logs. `.gitignore` excludes `*.tfstate`, which would otherwise contain the generated values in plaintext.
+
+To read the admin key when you need to register a tenant:
+```bash
+gcloud secrets versions access latest --secret=feature-flag-service-production-admin-api-key
+```
 
 ### Cloud Run Scaling Configuration
 
-| Setting | Production | Non-Production |
+| Setting | Production | Staging |
 |---|---|---|
 | `min_instance_count` | 2 | 0 (scale to zero) |
-| `max_instance_count` | 10 | 10 |
-| CPU | 1 vCPU | 1 vCPU |
+| `max_instance_count` | 20 | 4 |
+| CPU | 2 vCPU | 1 vCPU |
 | Memory | 512 Mi | 512 Mi |
 | Concurrency | Default (80) | Default (80) |
+| DB pool per instance | 10 | 10 |
 
-With `min_instance_count: 2` in production, there are always two warm instances ready to serve traffic without cold-start latency. Instances scale out automatically when concurrent requests per instance approach capacity.
+`min_instance_count: 2` in production keeps warm instances available. This matters more here than for a typical API: flag evaluation sits on the request path of every client application's page load, so a cold start does not show up as a slow request in *this* service's dashboard — it shows up as latency in someone else's product.
+
+**Connection budget.** The pool size is set explicitly rather than left to a driver default, because the ceiling is a product of instances × pool: 20 instances × 10 connections = 200 against Cloud SQL. Left implicit, a driver-default change could silently exhaust the instance's connection limit under exactly the load it was scaling up to serve.
 
 ---
 
 ## 8. Deployment Strategy
+
+### First-Time Provisioning (runbook)
+
+Terraform is split into three roots. Apply `shared/` once, then each environment independently.
+
+```bash
+# 0. Prerequisites: gcloud authenticated, project selected, billing enabled.
+export PROJECT_ID=<your-gcp-project>
+gcloud config set project "$PROJECT_ID"
+
+gcloud services enable \
+  run.googleapis.com sqladmin.googleapis.com redis.googleapis.com \
+  artifactregistry.googleapis.com secretmanager.googleapis.com \
+  servicenetworking.googleapis.com vpcaccess.googleapis.com \
+  monitoring.googleapis.com compute.googleapis.com
+
+# 1. Create the Terraform state bucket. It must exist before any `terraform init`,
+#    and versioning lets you recover from a corrupted or truncated state write.
+gsutil mb -p "$PROJECT_ID" -l us-central1 gs://feature-flag-service-tfstate
+gsutil versioning set on gs://feature-flag-service-tfstate
+
+# 2. Shared resources — Artifact Registry. Applied ONCE, not per environment.
+cd terraform/shared
+terraform init
+terraform apply -var="project_id=$PROJECT_ID"
+
+# 3. Build and push an image BEFORE the first environment apply: Cloud Run cannot
+#    create a revision from an image tag that does not exist yet.
+cd ../..
+REGISTRY=us-central1-docker.pkg.dev/$PROJECT_ID/feature-flag-service/feature-flag-service
+gcloud auth configure-docker us-central1-docker.pkg.dev
+docker build --target production -t "$REGISTRY:bootstrap" .
+docker push "$REGISTRY:bootstrap"
+
+# 4. Staging.
+cd terraform/envs/staging
+terraform init
+terraform apply -var="project_id=$PROJECT_ID" \
+                -var="image_tag=bootstrap" \
+                -var="alert_email=you@example.com"
+
+# 5. Production — separate state, separate resources, separate everything.
+cd ../production
+terraform init
+terraform apply -var="project_id=$PROJECT_ID" \
+                -var="image_tag=bootstrap" \
+                -var="alert_email=you@example.com"
+
+terraform output service_url
+```
+
+Provisioning takes 15–25 minutes on the first run; Cloud SQL and the VPC connector dominate.
+
+**After the first apply**, CI owns image tags and traffic splitting. The Cloud Run resource declares `lifecycle { ignore_changes = [traffic, image] }` precisely so that a later `terraform apply` — say, to change an alert threshold — does not yank 100% of traffic to the newest revision and silently undo an in-progress canary.
+
+**Registering the first tenant** (staging and production guard this endpoint):
+
+```bash
+ADMIN_KEY=$(gcloud secrets versions access latest \
+  --secret=feature-flag-service-production-admin-api-key)
+
+curl -X POST "$(terraform output -raw service_url)/api/v1/tenants" \
+  -H "Content-Type: application/json" \
+  -H "x-admin-key: $ADMIN_KEY" \
+  -d '{"name":"My App","slug":"my-app"}'
+```
+
+**Tearing down** (production has `deletion_protection = true` on Cloud SQL, so that must be disabled first):
+
+```bash
+terraform destroy -var="project_id=$PROJECT_ID"
+```
+
+---
 
 ### Blue-Green via Cloud Run Traffic Splitting
 
@@ -1052,12 +1194,16 @@ Staging uses a simplified variant of the same pattern:
 
 ```bash
 # Roll back to the revision tagged 'stable'
-gcloud run services update-traffic feature-flag-service \
+gcloud run services update-traffic feature-flag-service-production \
   --region=us-central1 \
   --to-revisions=stable=100
 ```
 
-This takes effect within seconds with no redeployment required.
+This takes effect within seconds with no redeployment required — the previous revision's containers still exist, so rollback is a routing change rather than a deploy.
+
+**Why the green revision is verified before it takes traffic.** The pipeline deploys with `--no-traffic --tag=green`, which gives the new revision its own URL while live traffic continues to the old one. It probes `/api/v1/health` on that tagged URL *first*, and only shifts 10% of traffic if the probe passes. A revision that boots but cannot reach its database therefore never receives a single user request — and because `/api/v1/health` returns **503** when PostgreSQL is unreachable rather than 200-with-an-error-body, that check actually fails when it should.
+
+**Note on database migrations and rollback.** Migrations run at container boot and are not reverted by a traffic rollback. Rolling back to a previous revision therefore leaves the newer schema in place, which is safe for additive changes (new tables, new nullable columns) and unsafe for destructive ones. The operational rule that follows: keep migrations backward-compatible with the previous revision — add columns, don't rename or drop them in the same deploy that ships code depending on the change. A rename becomes two deploys: add-and-backfill, then remove once the old revision is retired.
 
 ---
 
@@ -1117,7 +1263,19 @@ This starts three containers:
 - `redis` — Redis 7 on port `6379`, with a health check
 - `api` — NestJS application on port `3000`, in watch mode (`nest start --watch`)
 
-TypeORM's `synchronize: true` (enabled in non-production environments) automatically creates all tables on first boot. You do not need to run migrations manually in development.
+**Schema creation.** The application runs its TypeORM **migrations** at boot, in every environment including local development. `synchronize` is off everywhere. You do not need to run anything by hand.
+
+This is deliberate. The common setup — `synchronize` in development, migrations in production — means the schema you develop against is produced by a different mechanism than the one you ship, so the migration is never exercised until it runs in production for the first time. It also produces a database that can never afterwards be pointed at a production build: the tables exist but the `migrations` table is empty, so every migration fails with `relation "tenants" already exists`. Running migrations everywhere costs one command when you change an entity, and in exchange the schema path is identical from a developer's laptop to production.
+
+If you change an entity, generate the accompanying migration:
+
+```bash
+npm run migration:generate -- src/database/migrations/DescribeYourChange
+npm run migration:run       # applied automatically at boot, but useful to run explicitly
+npm run migration:revert    # roll back the most recent migration
+```
+
+`npm run migration:generate` diffs the entities against the live database. If it reports *"No changes in database schema were found"*, the migrations and entities agree — which is the check that keeps a deploy from failing on drift.
 
 Wait for the following log line before sending requests:
 
@@ -1176,8 +1334,8 @@ curl -s -X POST "http://localhost:3000/api/v1/tenants/${TENANT_ID}/flags" \
 ```bash
 curl -s -X POST http://localhost:3000/api/v1/evaluate \
   -H "Content-Type: application/json" \
+  -H "x-api-key: ${API_KEY}" \
   -d "{
-    \"tenantId\": \"${TENANT_ID}\",
     \"environment\": \"development\",
     \"userId\": \"user-abc123\",
     \"flagKey\": \"dark-mode\"
@@ -1233,6 +1391,12 @@ The most critical logic in the service is the evaluation algorithm. The unit tes
 | `NotFoundException` for a missing flag | API surface contract is enforced. |
 | Bulk evaluation returns all flags for the tenant | Proves the bulk path iterates all flags in the tenant namespace. |
 | 50% rollout distributes evenly over 1 000 users | Statistical test with a +/- 10% margin; verifies the hash function is not systematically biased. |
+| **Variants split evenly inside a partial rollout** | **Regression test for the correlated-hash bug** (Section 6). Rollout gating and variant selection once shared one bucket, so every gated-in user received the first variant and the second was never served. The endpoint returned 200 and honoured the rollout percentage exactly — nothing failed, the experiment just never ran. Only a distribution assertion catches this. |
+| Rollout and variant draws produce independent buckets | Proves the salts actually decorrelate the two decisions rather than merely appearing to. |
+| Rollout membership is stable when variant weights change | Re-weighting an experiment must not reshuffle who is in the rollout. |
+| Bulk evaluation performs exactly one database read | Pins the caching design: bulk must be O(1) in round trips, not one query per flag. |
+| 25 distinct users cost one database read | The property the definition-cache exists for — hit rate must be independent of user cardinality. |
+| Cache keys are scoped per tenant and environment | Proves one tenant's cached flags can never be served to another. |
 
 All external dependencies (PostgreSQL repository, Redis) are replaced with `jest.fn()` mocks so tests are deterministic, fast (milliseconds), and runnable without any infrastructure.
 
@@ -1255,6 +1419,16 @@ Verifies that tenant creation hashes the API key with bcrypt and that the hash i
 | Tenant B cannot list Tenant A's flags | Proves cross-tenant read prevention |
 | Tenant A cannot see flags created by Tenant B | Proves data isolation is bidirectional |
 | Unauthenticated requests return 401 | Proves missing API key is rejected before any business logic runs |
+
+**Audit history** (`audit-history.e2e-spec.ts`)
+
+| Test | Rationale |
+|---|---|
+| `previousValue` holds the pre-change environment config | Regression test for a shallow-copy bug: `{ ...flag }` shares the `environments` array, so mutating an env config before writing the audit row silently rewrote "previous" into the new value. Every audit entry claimed the change was a no-op. Only asserting on the nested value catches it. |
+| Entries record who changed it and when, newest first | The spec's audit requirements, asserted directly. |
+| The tenant endpoint never exposes key material | Guards the `select: false` on `apiKeyHash` / `apiKeyLookup` against an accidental `select: *` regression. |
+
+**The e2e suite builds its schema by running the real migrations**, not by synchronizing from entities. A missing or broken migration therefore fails CI rather than surfacing for the first time in production.
 
 These tests catch bugs that unit tests cannot: ORM query scoping errors, guard misconfiguration, or incorrect tenant resolution from the request context.
 
@@ -1281,6 +1455,10 @@ See Section 11 for full details.
 
 The load test is implemented in **k6** (`load-test/load-test.js`) and targets the two highest-traffic endpoints: single flag evaluation (`POST /api/v1/evaluate`) and bulk evaluation (`POST /api/v1/evaluate/bulk`).
 
+**The test drives multiple tenants, and that is not incidental.** The service enforces a per-tenant rate limit, so a single-tenant test at a few hundred req/s measures the throttler rather than the evaluation engine — it reports ~80% errors while the service behaves exactly as designed. A `setup()` phase provisions 8 tenants and their flags, and each virtual user is pinned to one, which is also the realistic shape of traffic for a multi-tenant platform. Throttled responses (429) are counted on a separate metric so a rate-limit rejection is never silently scored as a service error.
+
+The flag under test is a **string flag at 50% rollout with a 50/50 variant split**, so every request exercises both hash paths — the numbers reflect the real cost of the evaluation engine rather than a trivial lookup.
+
 ### Traffic Profile
 
 ```
@@ -1290,7 +1468,7 @@ Stage 3 (90s - 120s): ramp from 100 --> 200 virtual users
 Stage 4 (120s- 150s): ramp from 200 -->   0 virtual users (cool-down)
 ```
 
-Each virtual user sends one single-evaluation request and one bulk-evaluation request per iteration, separated by a 100 ms sleep. At peak (200 VUs), this represents approximately 1 800 requests per second across both endpoints.
+Each virtual user sends one single-evaluation request and one bulk-evaluation request per iteration, separated by a 100 ms sleep.
 
 ### Defined Pass/Fail Thresholds
 
@@ -1307,73 +1485,84 @@ thresholds: {
 | p99 response time | < 1 000 ms | The 99th percentile accounts for slow database queries on cache misses and GC pauses |
 | Error rate | < 5% | Service must remain available under peak load; errors above 5% indicate saturation or a misconfiguration |
 
-### Expected Results
+### Measured Results
 
-Since the service has not yet been deployed to a GCP production environment, the following are expected results based on the architecture design and the performance characteristics of each component.
+Measured against the **production Docker image** (not the dev watch-mode container), running on a single 1-CPU container with PostgreSQL and Redis alongside it on Docker Desktop. All k6 thresholds pass.
 
-**Cache-warm scenario (Redis hit rate approximately 90%):**
+| Metric | Result | Threshold |
+|---|---|---|
+| Throughput | **590 req/s** | — |
+| Iterations | 294/s (45 563 total) | — |
+| Median latency | **6.9 ms** | — |
+| p90 latency | 200 ms | — |
+| p95 latency | **361 ms** | < 500 ms ✅ |
+| p99 latency | < 1 000 ms | < 1 000 ms ✅ |
+| Error rate | **0.00%** (0 of 91 126) | < 5% ✅ |
 
-| Metric | Expected Value |
+**Steady-state, cache warm** (100 constant VUs after a warm-up phase, measured separately):
+
+| Metric | Result |
 |---|---|
-| p50 latency | 5 - 15 ms |
-| p95 latency | 50 - 80 ms |
-| p99 latency | 150 - 200 ms |
-| Error rate | < 0.1% |
-| Throughput | 1 500 - 2 000 req/s |
+| p95 latency | **63 ms** |
+| Max latency | 288 ms |
 
-At a 90% cache hit rate, the evaluation path is: Redis GET (network RTT approximately 1 ms within GCP) → JSON parse → return. No PostgreSQL query is needed.
+The gap between the two tables is entirely **ramp-up cost**, not steady-state behaviour. During the first seconds every tenant's cache is cold and every API key is unverified, so the instance pays its database reads and bcrypt verifications at once. Once warm, p95 sits at 63 ms. In production this window is smaller still: `min_instance_count: 2` keeps instances warm, and Cloud Run's startup probe holds a new revision out of rotation until it answers `/api/v1/health`.
 
-**Cache-cold scenario (first request per user per flag):**
+### What the numbers cost to get
 
-| Metric | Expected Value |
-|---|---|
-| p50 latency | 20 - 50 ms |
-| p95 latency | 200 - 350 ms |
-| p99 latency | 600 - 800 ms |
-| Error rate | < 1% |
+The first run of this test failed badly, and the fixes are the interesting part.
 
-Cold-path latency is bounded by the Cloud SQL query time plus a Redis SET. With private VPC connectivity and an indexed query on `(tenant_id, flag_key)`, the PostgreSQL response is expected to be under 10 ms for typical flag counts per tenant.
+| Change | Before | After |
+|---|---|---|
+| Rate limit set for a per-page-load endpoint (17 → 100 req/s per tenant) | 80% errors | 0% errors |
+| Cache flag **definitions** instead of per-user results | 47 ms median, 347 req/s | 7 ms median, 490 req/s |
+| Single-flight bcrypt verification (collapse concurrent verifies of one key) | 47 s max | 12 s max, 590 req/s |
+| Memoise verified API keys (60 s) | ~300 ms **per request** | ~0 ms warm |
 
-**Rationale for thresholds:**
+The bcrypt findings mattered most. At cost factor 12 a verify takes ~300 ms, and `bcryptjs` is pure JavaScript — it runs *on* the event loop, not in the thread pool. Paying that per request made authentication the single largest cost in a flag evaluation, far exceeding the database read it was protecting. Worse, on a cold cache every concurrent request for the same key started its *own* verification, so 200 simultaneous requests did not take 300 ms — they queued head-to-tail and stalled every other request on the instance. Memoising fixed the steady state; single-flighting fixed the stampede.
 
-The `p95 < 500 ms` and `p99 < 1000 ms` thresholds are deliberately conservative to accommodate worst-case scenarios: a cold cache, the database under write load from concurrent flag updates, or a burst of new users whose results are not yet cached. The 5% error threshold allows for transient connection errors during Cloud Run scale-out events without failing the test immediately.
+**Rationale for thresholds:** `p95 < 500 ms` and `p99 < 1000 ms` are deliberately conservative, accommodating a cold cache, the database under concurrent write load, and Cloud Run scale-out events. The 5% error budget allows transient connection errors during scale-out without failing the run.
 
 ### Running the Load Test
 
 ```bash
 # Install k6 from https://k6.io/docs/getting-started/installation/
 
-# Against the local Docker Compose stack
-# (requires a seeded tenantId with at least one flag in production environment)
+# Against the local Docker Compose stack.
+# No seeding needed — setup() provisions its own tenants and flags.
+k6 run -e BASE_URL=http://localhost:3000 load-test/load-test.js
+
+# Against a deployed Cloud Run URL. ADMIN_API_KEY is required wherever tenant
+# registration is guarded (staging and production).
 k6 run \
-  -e BASE_URL=http://localhost:3000 \
-  -e TENANT_ID=<your-tenant-uuid> \
+  -e BASE_URL=https://feature-flag-service-production-<hash>-uc.a.run.app \
+  -e ADMIN_API_KEY="$(gcloud secrets versions access latest \
+       --secret=feature-flag-service-production-admin-api-key)" \
   load-test/load-test.js
 
-# Against a deployed Cloud Run URL
-k6 run \
-  -e BASE_URL=https://feature-flag-service-<hash>-uc.a.run.app \
-  -e TENANT_ID=<your-tenant-uuid> \
-  load-test/load-test.js
+# Vary tenant count to see per-tenant rate limiting engage.
+k6 run -e BASE_URL=http://localhost:3000 -e TENANTS=2 load-test/load-test.js
 ```
 
 ---
 
 ## 12. Assumptions and Trade-offs
 
-### 1. TypeORM `synchronize: true` in Development
+### 1. Migrations Everywhere, `synchronize` Nowhere
 
-**Decision:** `synchronize: true` is enabled whenever `NODE_ENV` is not `production`. TypeORM automatically alters the database schema to match the entity definitions on application startup.
+**Decision:** `synchronize` is disabled in all environments. The schema is created exclusively by TypeORM migrations, which run at application boot — locally, in CI, and in production alike.
 
-**Rationale:** It eliminates friction during development and makes the integration test suite self-contained — no migration files need to be applied before running `npm run test:e2e`.
+**Rationale:** The conventional split (`synchronize` in development, migrations in production) means the schema you develop against is produced by a different mechanism than the one you ship. The migration is then never exercised until it runs in production for the first time, which is the worst possible moment to discover it is wrong. It also creates a one-way door: a database bootstrapped by `synchronize` can never afterwards be pointed at a production build, because the tables exist but the `migrations` table is empty, so every migration fails with `relation "tenants" already exists`. Running migrations everywhere means the migration path is exercised on every developer's machine, every CI run, and every deploy.
 
-**Trade-off:** `synchronize: true` is explicitly disabled in production (`config.get('NODE_ENV') !== 'production'` in `app.module.ts`). Schema changes in production require a proper migration file reviewed as part of a pull request. The risk of accidentally enabling it in production is mitigated by the environment variable check. The downside is that schema drift in development is silently resolved by synchronize rather than surfacing as a failing migration — a considered trade-off for developer ergonomics in a time-boxed project.
+**Trade-off:** Changing an entity now requires generating a migration instead of just restarting. That is the intended cost — it converts a deploy-time failure into a development-time one. `npm run migration:generate` reporting "No changes in database schema were found" is the signal that entities and migrations agree, and this repository is verified in that state.
+
+**Concurrency:** Migrations run at boot, and production starts with `min_instance_count: 2`, so instances boot simultaneously. Without coordination both would read an empty migrations table and both attempt the baseline; the loser crash-loops on "relation already exists". A PostgreSQL **session-level advisory lock** (`src/database/run-migrations.ts`) serialises this: the second instance blocks until the first commits, then finds the migration already recorded and proceeds. PostgreSQL releases the lock automatically if an instance dies mid-migration.
 
 ---
 
 ### 2. Redis is Optional and Fail-Open
 
-**Decision:** All Redis operations in `RedisService` (`get`, `set`, `del`, `delPattern`) are wrapped in try/catch blocks that silently swallow errors. A Redis failure causes the service to skip caching entirely and fall through to PostgreSQL on every request.
+**Decision:** All Redis operations in `RedisService` (`get`, `set`, `del`) are wrapped in try/catch blocks that silently swallow errors. A Redis failure causes the service to skip caching entirely and fall through to PostgreSQL on every request.
 
 **Rationale:** Feature flag evaluation is a critical path for many callers. A Redis outage should degrade performance — higher PostgreSQL load — but must not cause API errors. The service remains completely correct without Redis.
 
@@ -1381,13 +1570,13 @@ k6 run \
 
 ---
 
-### 3. Evaluation Endpoints are Unauthenticated
+### 3. Evaluation Endpoints are Authenticated and Tenant-Scoped by Key
 
-**Decision:** `POST /api/v1/evaluate` and `POST /api/v1/evaluate/bulk` do not require an API key. The `tenantId` in the request body scopes all database queries.
+**Decision:** `POST /api/v1/evaluate` and `POST /api/v1/evaluate/bulk` require an `x-api-key`. The tenant is resolved from the key server-side; `tenantId` is not accepted in the body. This is what prevents one tenant from evaluating another tenant's flags.
 
-**Rationale:** Feature flag evaluation is typically called from client-side applications — browsers, mobile apps — where an API key cannot be kept secret. Any user inspecting network traffic would see it. The data exposed (flag values for a known tenant ID) is already visible to the end user through the UI the flag controls. Requiring authentication on the evaluation path would create false security while adding friction for SDK developers.
+**Rationale:** Deriving the tenant from the authenticated key (rather than trusting a body field) closes the isolation hole where any caller who knew a `tenantId` could read that tenant's flag values. The same `ApiKeyGuard` that protects the management endpoints protects evaluation and SSE.
 
-**Trade-off:** A caller who knows a `tenantId` can enumerate flag evaluations for that tenant. Mitigation in a future version: a separate, read-only SDK key scoped specifically to evaluation, distinct from the management API key that controls flag configuration. The rate limiter (1 000 req/min per IP) limits bulk enumeration attempts.
+**Trade-off / future work:** For public client-side SDKs (browsers, mobile) where a key cannot be kept secret, the production pattern is a separate **read-only SDK key** scoped to evaluation only, distinct from the management key that controls flag configuration. That split is a future improvement; today both surfaces share one key type.
 
 ---
 
@@ -1401,23 +1590,27 @@ k6 run \
 
 ---
 
-### 5. Rate Limiting by IP, Not by Tenant
+### 5. Rate Limiting per Tenant
 
-**Decision:** `ThrottlerModule` limits to 1 000 requests per minute per IP address, not per tenant API key.
+**Decision:** A global `TenantThrottlerGuard` (extending `@nestjs/throttler`'s `ThrottlerGuard`) limits each tenant to **6 000 requests per 60-second window** (~100 req/s sustained), keyed on the tenant's API key and falling back to source IP for unauthenticated routes. Configurable via `THROTTLE_LIMIT` / `THROTTLE_TTL_MS`.
 
-**Rationale:** IP-based limiting is natively supported by `@nestjs/throttler` with zero additional configuration and does not require any changes to the authentication flow. It provides adequate protection against naive scraping, accidental tight-loop calls, and simple denial-of-service attempts.
+**Rationale:** Keying on the API key gives true per-tenant isolation — one noisy tenant cannot consume another's budget, which addresses the noisy-neighbor problem directly. The guard reads the `x-api-key` header rather than the resolved `req.tenant` because it runs globally, before the per-controller `ApiKeyGuard` populates the tenant; the raw key maps 1:1 to a tenant, so it is a stable per-tenant identifier.
 
-**Trade-off:** A tenant operating behind a shared corporate NAT would share a rate limit with other tenants on the same egress IP address. Conversely, a malicious tenant with many source IPs could exceed the intended per-tenant limit. For the scope of this assessment, IP-based limiting was the pragmatic choice. The correct production approach is to attach the rate-limit counter to the resolved tenant after API key verification.
+**On the limit itself:** the original value of 1 000/minute (~17 req/s) was too low for what this endpoint is. Flag evaluation sits on the request path of every client page load, so a limit low enough to feel "safe" simply breaks the callers it is meant to protect — the load test surfaced this immediately, failing at 80% errors while the throttler behaved exactly as configured. The purpose here is noisy-neighbour containment, not a billing quota, so the limit is set well above realistic single-tenant traffic and low enough to stop one tenant saturating an instance.
+
+**Trade-off:** A fixed window per key, not a sliding window or token bucket, so a tenant can burst at a window boundary. Per-plan tiered limits and a smoother algorithm would both be worthwhile; the single global rate is adequate at this scope. The window is also per-instance rather than shared through Redis, so the effective cluster-wide limit scales with instance count — acceptable for containment, but it means the number is a floor rather than a hard ceiling.
 
 ---
 
 ### 6. bcrypt for API Key Hashing
 
-**Decision:** API keys are hashed with `bcryptjs` (12 rounds) before storage. The `ApiKeyGuard` verifies an incoming key by bcrypt-comparing it against every active tenant's stored hash.
+**Decision:** API keys are hashed with `bcryptjs` (12 rounds) before storage, and each tenant additionally stores an indexed SHA-256 "lookup" digest of the same key. Authentication is a three-step path: indexed SHA-256 lookup → one bcrypt verify → memoise the result for 60 seconds.
 
-**Rationale:** bcrypt is the industry standard for hashing secrets that must be verifiable without storing the plaintext. If the database is compromised, attackers cannot reverse the hashes to obtain the original API keys.
+**Rationale:** bcrypt is the standard for secrets that must be verifiable without storing plaintext — a database compromise does not yield usable API keys. The SHA-256 lookup column makes authentication **O(1)** rather than O(number of tenants): it narrows to a single candidate row, so exactly one bcrypt comparison runs instead of one per tenant. A fast hash is safe for this index because the key is 128 bits of randomness, not a guessable password; bcrypt still governs storage.
 
-**Trade-off:** bcrypt is intentionally slow (that is its security property). At 12 rounds, a single comparison takes approximately 100-300 ms on modern hardware. The guard iterates through all active tenants sequentially, making authentication O(N) in the number of tenants. At small tenant counts (tens to hundreds), this is imperceptible. At large counts (thousands), this becomes a significant latency bottleneck. The production solution is to cache a mapping of `sha256(apiKey) -> tenantId` in Redis with a short TTL, reducing authentication to a single O(1) Redis lookup on repeat requests.
+**Why the memoisation is not optional.** At cost factor 12 a bcrypt verify takes ~300 ms, which made authentication the single largest cost in a flag evaluation — larger than the database read and cache lookup combined. Two effects compound it: `bcryptjs` is pure JavaScript, so it runs *on* the event loop rather than in the thread pool; and without deduplication every concurrent request bearing the same uncached key started its own verification. Under 200 concurrent virtual users that produced a self-inflicted thundering herd, with individual requests stalling for tens of seconds. The guard therefore does two things: caches verified keys for 60 s, and **single-flights** in-flight verifications so N concurrent requests for one key perform one bcrypt between them.
+
+**Trade-off:** The cache is a per-instance `Map`, so a **revoked key remains usable on an already-warm instance for up to 60 seconds**. That is the deliberate exchange — bounded staleness on revocation, in return for removing ~300 ms from every request. It is marked in the source with the upgrade path: move the entry to Redis with explicit invalidation on revocation if instant revocation becomes a requirement.
 
 ---
 
@@ -1605,8 +1798,9 @@ Push to 'main' or 'staging' branch
 ## Quick Reference
 
 ```
-GET    /api/v1/health                                        Health check (no auth)
-POST   /api/v1/tenants                                       Create tenant
+GET    /api/v1/health                                        Health check      (no auth)
+GET    /api/v1/metrics                                       Prometheus metrics(no auth)
+POST   /api/v1/tenants                                       Create tenant     (no auth)
 GET    /api/v1/tenants                                       List tenants
 GET    /api/v1/tenants/:id                                   Get tenant by ID
 POST   /api/v1/tenants/:tenantId/flags                      Create flag       [x-api-key]
@@ -1614,7 +1808,7 @@ GET    /api/v1/tenants/:tenantId/flags                      List flags        [x
 PUT    /api/v1/tenants/:tenantId/flags/:flagKey             Update flag       [x-api-key]
 DELETE /api/v1/tenants/:tenantId/flags/:flagKey             Archive flag      [x-api-key]
 GET    /api/v1/tenants/:tenantId/flags/:flagKey/history     Audit history     [x-api-key]
-POST   /api/v1/evaluate                                      Evaluate flag     (no auth)
-POST   /api/v1/evaluate/bulk                                 Evaluate all      (no auth)
-GET    /api/v1/sse/flags?tenantId=&environment=              SSE stream        (no auth)
+POST   /api/v1/evaluate                                      Evaluate flag     [x-api-key]
+POST   /api/v1/evaluate/bulk                                 Evaluate all      [x-api-key]
+GET    /api/v1/sse/flags?environment=                        SSE stream        [x-api-key]
 ```

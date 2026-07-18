@@ -28,7 +28,14 @@ describe('TenantsService', () => {
   describe('create', () => {
     it('creates a tenant and returns a raw API key', async () => {
       mockRepo.findOne.mockResolvedValue(null);
-      const tenant = { id: 't1', name: 'App A', slug: 'app-a', apiKeyHash: 'hash', isActive: true, createdAt: new Date() };
+      const tenant = {
+        id: 't1',
+        name: 'App A',
+        slug: 'app-a',
+        apiKeyHash: 'hash',
+        isActive: true,
+        createdAt: new Date(),
+      };
       mockRepo.create.mockReturnValue(tenant);
       mockRepo.save.mockResolvedValue(tenant);
 
@@ -39,14 +46,18 @@ describe('TenantsService', () => {
 
     it('throws ConflictException if tenant already exists', async () => {
       mockRepo.findOne.mockResolvedValue({ id: 'existing' });
-      await expect(service.create({ name: 'App A', slug: 'app-a' })).rejects.toThrow(ConflictException);
+      await expect(
+        service.create({ name: 'App A', slug: 'app-a' }),
+      ).rejects.toThrow(ConflictException);
     });
   });
 
   describe('findOne', () => {
     it('throws NotFoundException if tenant not found', async () => {
       mockRepo.findOne.mockResolvedValue(null);
-      await expect(service.findOne('nonexistent-id')).rejects.toThrow(NotFoundException);
+      await expect(service.findOne('nonexistent-id')).rejects.toThrow(
+        NotFoundException,
+      );
     });
 
     it('returns tenant if found', async () => {

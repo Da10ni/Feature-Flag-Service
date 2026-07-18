@@ -1,4 +1,13 @@
-import { IsString, IsOptional, IsBoolean, IsNumber, Min, Max, IsArray, IsObject } from 'class-validator';
+import {
+  IsString,
+  IsOptional,
+  IsBoolean,
+  IsNumber,
+  Min,
+  Max,
+  IsArray,
+  IsObject,
+} from 'class-validator';
 
 export class UpdateFlagDto {
   @IsOptional() @IsString() name?: string;

@@ -1,10 +1,24 @@
-import { IsString, IsNotEmpty, IsEnum, IsOptional, IsBoolean, IsNumber, Min, Max, IsArray, ValidateNested, IsObject } from 'class-validator';
+import {
+  IsString,
+  IsNotEmpty,
+  IsEnum,
+  IsOptional,
+  IsBoolean,
+  IsNumber,
+  Min,
+  Max,
+  IsArray,
+  ValidateNested,
+  IsObject,
+  IsDefined,
+} from 'class-validator';
 import { Type } from 'class-transformer';
 import { FlagType } from '../entities/feature-flag.entity';
 import { Environment } from '../entities/flag-environment.entity';
 
 export class VariantDto {
-  value: any;
+  // Polymorphic (string/number/bool) — @IsDefined keeps it past whitelist stripping.
+  @IsDefined() value: any;
   @IsNumber() @Min(0) @Max(100) weight: number;
 }
 
@@ -21,7 +35,11 @@ export class CreateFlagDto {
   @IsString() @IsNotEmpty() name: string;
   @IsOptional() @IsString() description?: string;
   @IsEnum(FlagType) type: FlagType;
-  defaultValue: any;
-  @IsOptional() @IsArray() @ValidateNested({ each: true }) @Type(() => EnvironmentConfigDto)
+  // Polymorphic default (bool/string/number) — @IsDefined survives whitelist stripping.
+  @IsDefined() defaultValue: any;
+  @IsOptional()
+  @IsArray()
+  @ValidateNested({ each: true })
+  @Type(() => EnvironmentConfigDto)
   environments?: EnvironmentConfigDto[];
 }
