@@ -16,8 +16,6 @@ import { CreateFlagDto } from './dto/create-flag.dto';
 import { UpdateFlagDto } from './dto/update-flag.dto';
 import { RedisService } from '../redis/redis.service';
 
-// Audit rows are append-only and must capture state as it was at write time, detached
-// from the live entity. structuredClone is Node stdlib — no dependency needed.
 const snapshot = <T>(entity: T): T => structuredClone(entity);
 
 @Injectable()
@@ -31,12 +29,6 @@ export class FlagsService {
     private redisService: RedisService,
   ) {}
 
-  // The evaluation cache holds one flag-set per (tenant, environment), so invalidating a
-  // change is three explicit DELs — not a KEYS scan over every cached user.
-  //
-  // That matters beyond tidiness: Redis KEYS is O(total keys) and blocks the single-threaded
-  // server for the whole scan, so the old per-user scheme turned every flag toggle into a
-  // latency spike for every tenant on the instance.
   private async invalidateCache(tenantId: string): Promise<void> {
     await Promise.all(
       Object.values(Environment).map((env) =>
@@ -84,8 +76,6 @@ export class FlagsService {
       }),
     );
 
-    // A create changes the tenant's flag SET, so the cached set is stale too — without
-    // this a new flag stays invisible to bulk evaluation until the TTL lapses.
     await this.invalidateCache(tenantId);
     this.eventEmitter.emit('flag.changed', {
       tenantId,
@@ -131,9 +121,7 @@ export class FlagsService {
     changedBy: string,
   ): Promise<FeatureFlag> {
     const flag = await this.findOne(tenantId, flagKey);
-    // Deep clone, not `{ ...flag }`: a shallow copy shares the `environments` array, so
-    // mutating an env config below would also rewrite the "previous" value we're about to
-    // audit — the log would show the new rollout/toggle as its own prior state.
+
     const previousValue = snapshot(flag);
 
     if (dto.name !== undefined) flag.name = dto.name;

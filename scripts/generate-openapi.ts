@@ -1,15 +1,3 @@
-/**
- * Writes the OpenAPI document to openapi.json.
- *
- * The spec is generated from the live Nest application rather than hand-written, so it
- * cannot describe a route that does not exist or omit one that does. Run it after changing
- * any controller or DTO:
- *
- *     npm run openapi:generate
- *
- * Requires the database to be reachable (`docker compose up -d postgres redis`), because
- * building the document means instantiating the real application module.
- */
 import { NestFactory } from '@nestjs/core';
 import { writeFileSync } from 'fs';
 import { join } from 'path';
@@ -17,7 +5,6 @@ import { AppModule } from '../src/app.module';
 import { buildOpenApiDocument } from '../src/swagger';
 
 async function generate(): Promise<void> {
-  // logger: false keeps the generated-file output readable; the app is never listened on.
   const app = await NestFactory.create(AppModule, { logger: false });
   app.setGlobalPrefix('api/v1');
   await app.init();

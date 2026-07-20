@@ -146,8 +146,6 @@ jobs:
       - name: Smoke test canary revision
         run: |
           SERVICE=${{ env.IMAGE_NAME }}-staging
-          # The canary tag gives the new revision its own URL, isolated from live traffic,
-          # so this exercises the real revision without any user reaching it.
           CANARY_URL=$(gcloud run services describe "$SERVICE" \
             --region=us-central1 \
             --format='value(status.traffic.filter("tag:canary").extract("url"))' | tr -d "[]'")
@@ -156,8 +154,6 @@ jobs:
             exit 1
           fi
           echo "Probing $CANARY_URL/api/v1/health"
-          # /health returns 503 when Postgres is unreachable, so this catches a revision
-          # that boots but cannot serve.
           STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 "$CANARY_URL/api/v1/health")
           if [ "$STATUS" != "200" ]; then
             echo "Canary health check failed with status $STATUS — not promoting"
@@ -207,8 +203,6 @@ jobs:
             --region=us-central1 \
             --format='value(status.latestCreatedRevisionName)')
           echo "NEW_REVISION=$NEW_REVISION" >> "$GITHUB_ENV"
-          # Capture the currently-serving revision BEFORE shifting traffic — this is the
-          # rollback target, and it must be recorded while it is still the live one.
           PREV_REVISION=$(gcloud run services describe "$SERVICE" \
             --region=us-central1 \
             --format='value(status.traffic[0].revisionName)')

@@ -25,9 +25,6 @@ describe('Tenant Isolation (Integration)', () => {
     const slug = () =>
       `test-${Date.now()}-${Math.random().toString(36).substring(7)}`;
 
-    // AdminKeyGuard is enforced in the suite (see test/setup-env.ts), so registration
-    // carries the admin key. Statuses are asserted here so a setup failure surfaces as
-    // "expected 201" rather than as confusing 404s in every test below.
     const resA = await request(app.getHttpServer())
       .post('/api/v1/tenants')
       .set('x-admin-key', process.env.ADMIN_API_KEY!)
@@ -109,9 +106,6 @@ describe('Tenant Isolation (Integration)', () => {
     expect(res.status).toBe(401);
   });
 
-  // Tenant registration mints an API key, so an open endpoint means anyone can provision
-  // themselves credentials. These two pin AdminKeyGuard: if it ever regresses to allowing
-  // unkeyed registration, they fail.
   it('should reject tenant registration without an admin key', async () => {
     const res = await request(app.getHttpServer())
       .post('/api/v1/tenants')

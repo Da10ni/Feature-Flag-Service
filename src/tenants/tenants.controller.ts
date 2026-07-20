@@ -73,9 +73,6 @@ export class TenantsController {
     };
   }
 
-  // Scoped to the caller's own tenant. There is deliberately no "list all tenants"
-  // route: the spec doesn't ask for one, and on a public URL it would enumerate every
-  // tenant on the platform.
   @Get('me')
   @UseGuards(ApiKeyGuard)
   @ApiSecurity('api-key')

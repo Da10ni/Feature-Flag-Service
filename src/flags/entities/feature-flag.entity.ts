@@ -19,7 +19,6 @@ export enum FlagType {
 }
 
 @Entity('feature_flags')
-// Unique per tenant, not globally — two tenants may each own a flag called "new-checkout".
 @Index('IDX_feature_flags_tenant_key', ['tenantId', 'flagKey'], {
   unique: true,
 })

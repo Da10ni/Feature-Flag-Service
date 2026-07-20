@@ -1,10 +1,3 @@
-# Composition module: one complete, self-contained environment.
-#
-# Both env roots (envs/staging, envs/production) instantiate this with different inputs, so
-# the two environments are guaranteed to have identical shape and differ only in the values
-# that should differ — size, scaling, CIDR, alert thresholds. Adding a resource here adds it
-# to every environment, which is what stops staging and production drifting apart.
-
 variable "project_id" { type = string }
 variable "region" { type = string }
 variable "app_name" { type = string }
@@ -27,32 +20,23 @@ variable "enable_custom_metric_alerts" {
   description = "See modules/observability — enable on a second apply once the service has served traffic."
 }
 
-# Service account account_id is capped at 30 characters by GCP, well below what
-# "<app_name>-<environment>-sa" produces (31+ with app_name = "feature-flag-service"), so
-# that one resource uses this abbreviated prefix. Everything else keeps the readable name.
 variable "short_name" {
   type        = string
   default     = "ffs"
   description = "Abbreviated app_name, used only where GCP name limits forbid the full prefix."
   validation {
-    # Keeping short_prefix under 12 leaves ample room under the 30-char service account cap.
     condition     = length(var.short_name) <= 12
     error_message = "short_name must be 12 characters or fewer to keep derived names within GCP limits."
   }
 }
 
 locals {
-  # Every resource carries the environment in its name, so staging and production can
-  # coexist in a single GCP project without colliding.
   name_prefix  = "${var.app_name}-${var.environment}"
   service_name = "${var.app_name}-${var.environment}"
 
-  # e.g. "ffs-stg" / "ffs-prod" — max 17 chars, so "-con" and "-sa" both stay legal.
   env_short    = { development = "dev", staging = "stg", production = "prod" }[var.environment]
   short_prefix = "${var.short_name}-${local.env_short}"
 
-  # Artifact Registry is shared across environments (see terraform/shared) so the exact
-  # image validated in staging is the one promoted to production — never a rebuild.
   image = "${var.region}-docker.pkg.dev/${var.project_id}/${var.app_name}/${var.app_name}:${var.image_tag}"
 }
 

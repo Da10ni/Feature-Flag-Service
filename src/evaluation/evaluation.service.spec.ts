@@ -92,7 +92,6 @@ describe('EvaluationService', () => {
       expect(buckets.size).toBeGreaterThan(10);
     });
 
-    // Same flag, same user, different decision — the salt must decorrelate them.
     it('gives rollout and variant decisions independent buckets', () => {
       let differ = 0;
       for (let i = 0; i < 200; i++) {
@@ -135,7 +134,6 @@ describe('EvaluationService', () => {
     });
 
     it('returns defaultValue for users outside rollout percentage', async () => {
-      // Use rolloutPercentage=0 so ALL users are outside rollout
       const env = makeEnv({ isEnabled: true, rolloutPercentage: 0 });
       const flag = makeFlag({ environments: [env] });
       mockFlagRepo.find.mockResolvedValue([flag]);
@@ -232,20 +230,16 @@ describe('EvaluationService', () => {
         userId: 'u1',
       });
 
-      // Not one query per flag: bulk evaluation must be O(1) in database round trips.
       expect(mockFlagRepo.find).toHaveBeenCalledTimes(1);
     });
   });
 
-  // The cache holds flag definitions, not per-user results. That is what makes the hit rate
-  // independent of how many distinct users call in — the property the whole design rests on.
   describe('caching strategy', () => {
     it('serves distinct users from one cached flag-set', async () => {
       const env = makeEnv({ isEnabled: true, rolloutPercentage: 100 });
       const flag = makeFlag({ environments: [env] });
       mockFlagRepo.find.mockResolvedValue([flag]);
 
-      // First call populates the cache; subsequent calls read it back.
       mockRedis.get.mockResolvedValueOnce(null);
       mockRedis.get.mockResolvedValue(JSON.stringify([flag]));
 
@@ -287,7 +281,6 @@ describe('EvaluationService', () => {
 
   describe('percentage rollout distribution', () => {
     it('approximately distributes users across 50% rollout', () => {
-      // With 50% rollout, approximately half of users should be in
       let inRollout = 0;
       const total = 1000;
       for (let i = 0; i < total; i++) {
@@ -298,14 +291,11 @@ describe('EvaluationService', () => {
         );
         if (bucket < 50) inRollout++;
       }
-      // Allow 10% margin
+
       expect(inRollout).toBeGreaterThan(total * 0.4);
       expect(inRollout).toBeLessThan(total * 0.6);
     });
 
-    // Regression: rollout and variant selection once shared a single hash bucket, which
-    // correlated the two decisions. Everyone who passed a 50% gate had bucket < 50, so a
-    // 50/50 variant split gave 100% of them the first variant and 0% the second.
     it('splits variants evenly among users inside a partial rollout', () => {
       const variants = [
         { value: 'control', weight: 50 },
@@ -328,7 +318,6 @@ describe('EvaluationService', () => {
         counts[String(result.value)] = (counts[String(result.value)] ?? 0) + 1;
       }
 
-      // ~50% gated out (value 'off'), and the ~1000 who pass split ~evenly.
       expect(counts.control).toBeGreaterThan(300);
       expect(counts.treatment).toBeGreaterThan(300);
       const ratio = counts.control / counts.treatment;
@@ -337,7 +326,6 @@ describe('EvaluationService', () => {
     });
 
     it('keeps rollout membership stable when variant weights change', () => {
-      // Independent salts mean re-weighting variants must not reshuffle who is in the rollout.
       const inRollout = (userId: string) =>
         (service as any).computeHash('rollout', 'my-flag', userId) < 50;
       const before = Array.from({ length: 200 }, (_, i) =>

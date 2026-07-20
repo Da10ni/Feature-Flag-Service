@@ -7,9 +7,6 @@ terraform {
     }
   }
 
-  # Distinct state prefix from staging — the two environments never share state.
-  # Bucket supplied at init (GCS names are globally unique):
-  #   terraform init -backend-config="bucket=$PROJECT_ID-tfstate"
   backend "gcs" {
     prefix = "terraform/state/production"
   }
@@ -30,17 +27,12 @@ module "env" {
   image_tag   = var.image_tag
   alert_email = var.alert_email
 
-  # Mirrors the staging plan, shifted so the two environments never overlap:
-  #   peering_address  10.20.0.0/16   -> Cloud SQL + Memorystore
-  #   subnet_cidr      10.220.0.0/24  -> Cloud Run, via Direct VPC egress
   peering_address = "10.20.0.0"
   subnet_cidr     = "10.220.0.0/24"
   db_tier         = "db-custom-2-4096"
   redis_memory_gb = 2
-  # Warm instances: flag evaluation is on the request path of every client app, so a cold
-  # start would show up as a latency spike in someone else's product.
-  min_instances = 2
-  max_instances = 20
+  min_instances   = 2
+  max_instances   = 20
 
   enable_custom_metric_alerts = var.enable_custom_metric_alerts
   eval_latency_threshold_ms   = 250

@@ -12,9 +12,6 @@ export class AuditLog {
   @PrimaryGeneratedColumn('uuid')
   id: string;
 
-  // Explicit uuid: these reference tenants.id / feature_flags.id, and without the type
-  // hint TypeORM infers varchar from the TS `string`, which indexes and compares worse.
-  // Deliberately NOT foreign keys — an audit row must survive the flag it describes.
   @Column({ name: 'tenant_id', type: 'uuid' })
   tenantId: string;
 

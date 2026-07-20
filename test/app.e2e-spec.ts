@@ -3,7 +3,6 @@ import { INestApplication } from '@nestjs/common';
 import request from 'supertest';
 import { AppModule } from './../src/app.module';
 
-// Smoke test: the app boots and the health endpoint (behind the api/v1 prefix) responds.
 describe('Health (e2e)', () => {
   let app: INestApplication;
 

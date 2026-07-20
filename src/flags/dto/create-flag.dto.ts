@@ -24,7 +24,6 @@ export class VariantDto {
     example: 'treatment',
     oneOf: [{ type: 'string' }, { type: 'number' }, { type: 'boolean' }],
   })
-  // Polymorphic (string/number/bool) — @IsDefined keeps it past whitelist stripping.
   @IsDefined()
   value: any;
 
@@ -97,9 +96,6 @@ export class EnvironmentConfigDto {
   })
   @IsOptional()
   @IsArray()
-  // @ValidateNested + @Type are required for the array elements to be validated at all.
-  // Without them class-transformer leaves plain objects and VariantDto's rules never run,
-  // so a weight of "fifty" would persist and silently corrupt the variant bucket maths.
   @ValidateNested({ each: true })
   @Type(() => VariantDto)
   variants?: VariantDto[];
@@ -146,7 +142,6 @@ export class CreateFlagDto {
     example: false,
     oneOf: [{ type: 'boolean' }, { type: 'string' }, { type: 'number' }],
   })
-  // Polymorphic default (bool/string/number) — @IsDefined survives whitelist stripping.
   @IsDefined()
   defaultValue: any;
 

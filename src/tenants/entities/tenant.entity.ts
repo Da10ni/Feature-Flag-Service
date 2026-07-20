@@ -20,13 +20,9 @@ export class Tenant {
   @Column({ unique: true })
   slug: string;
 
-  // select: false keeps credential material out of every ordinary query, so it can't be
-  // serialized into an API response by accident. The auth guard opts back in explicitly.
   @Column({ name: 'api_key_hash', select: false })
   apiKeyHash: string;
 
-  // Indexed SHA-256 of the raw key for O(1) lookup — the API key is 128-bit random,
-  // so a fast hash is safe for the index. bcrypt (apiKeyHash) still guards storage.
   @Index('IDX_tenants_api_key_lookup')
   @Column({ name: 'api_key_lookup', nullable: true, select: false })
   apiKeyLookup: string;

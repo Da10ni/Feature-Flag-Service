@@ -1,15 +1,6 @@
 import { INestApplication } from '@nestjs/common';
 import { DocumentBuilder, SwaggerModule, OpenAPIObject } from '@nestjs/swagger';
 
-/**
- * One definition of the OpenAPI document, shared by the running app (which serves Swagger
- * UI at /api/v1/docs) and `npm run openapi:generate` (which writes openapi.json to disk).
- *
- * Sharing it is the point: a hand-maintained spec file drifts from the code the moment
- * someone adds a route, and a spec that lies is worse than no spec. This one is derived
- * from the controllers and DTOs themselves, so it cannot describe an endpoint that does
- * not exist or miss one that does.
- */
 export function buildOpenApiDocument(app: INestApplication): OpenAPIObject {
   const config = new DocumentBuilder()
     .setTitle('Multi-Tenant Feature Flag Service')
@@ -92,16 +83,6 @@ export function buildOpenApiDocument(app: INestApplication): OpenAPIObject {
 
   const document = SwaggerModule.createDocument(app, config);
 
-  // Mark unauthenticated operations as explicitly public.
-  //
-  // In OpenAPI an operation with no `security` key inherits the document default, which
-  // reads as "unspecified" rather than "open" — validators flag it, and a client generator
-  // cannot tell a deliberately public endpoint from one where the author forgot. An empty
-  // array is the spec's way of saying "no credentials required".
-  //
-  // Every authenticated controller carries @ApiSecurity, so anything still lacking security
-  // here is public by design: /health and /metrics, both of which are probe targets that
-  // must be reachable without credentials.
   for (const pathItem of Object.values(document.paths)) {
     for (const operation of Object.values(pathItem)) {
       if (
@@ -121,12 +102,10 @@ export function buildOpenApiDocument(app: INestApplication): OpenAPIObject {
 export function setupSwagger(app: INestApplication): void {
   const document = buildOpenApiDocument(app);
 
-  // Served under the global prefix: /api/v1/docs (UI) and /api/v1/docs-json (raw spec).
   SwaggerModule.setup('api/v1/docs', app, document, {
     jsonDocumentUrl: 'api/v1/docs-json',
     customSiteTitle: 'Feature Flag Service API',
     swaggerOptions: {
-      // Persist the API key across page reloads so "Try it out" stays usable.
       persistAuthorization: true,
       docExpansion: 'list',
       tagsSorter: 'alpha',

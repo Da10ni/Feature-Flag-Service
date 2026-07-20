@@ -36,8 +36,6 @@ export class SseController {
     this.events$.next(event);
   }
 
-  // Subscribers only ever see their own tenant's stream — scoped by the authenticated
-  // API key, not a query param.
   @Sse('flags')
   @ApiOperation({
     summary: 'Subscribe to flag changes (Server-Sent Events)',

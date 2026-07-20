@@ -6,14 +6,10 @@ import {
   collectDefaultMetrics,
 } from 'prom-client';
 
-// One registry, the four metric families the spec asks for. Scraped at /metrics by
-// Google Cloud Managed Service for Prometheus (see terraform), which is what "exported
-// to Cloud Monitoring" means here — no per-request write API calls.
 @Injectable()
 export class MetricsService {
   readonly registry = new Registry();
 
-  // Flag evaluation latency — histogram gives p50/p95/p99 in Cloud Monitoring.
   private readonly evalLatency = new Histogram({
     name: 'flag_evaluation_duration_seconds',
     help: 'Flag evaluation latency in seconds',
@@ -22,7 +18,6 @@ export class MetricsService {
     registers: [this.registry],
   });
 
-  // Evaluations per second by tenant — derive rate() from this counter.
   private readonly evalCount = new Counter({
     name: 'flag_evaluations_total',
     help: 'Total flag evaluations',
@@ -30,15 +25,13 @@ export class MetricsService {
     registers: [this.registry],
   });
 
-  // Cache hit/miss ratio.
   private readonly cacheAccess = new Counter({
     name: 'flag_evaluation_cache_total',
     help: 'Flag evaluation cache accesses',
-    labelNames: ['result'], // hit | miss
+    labelNames: ['result'],
     registers: [this.registry],
   });
 
-  // HTTP latency + error rate by tenant and endpoint.
   private readonly httpLatency = new Histogram({
     name: 'http_request_duration_seconds',
     help: 'HTTP request latency in seconds',

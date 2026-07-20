@@ -3,10 +3,6 @@ import { INestApplication, ValidationPipe } from '@nestjs/common';
 import request from 'supertest';
 import { AppModule } from '../src/app.module';
 
-// The spec requires the audit log to record "the previous value". That is easy to get
-// subtly wrong: a shallow copy of the flag shares its `environments` array, so mutating an
-// environment config before writing the audit row silently rewrites the "previous" value
-// into the new one. These tests pin the observable behaviour end to end.
 describe('Audit History (Integration)', () => {
   let app: INestApplication;
   let tenantId: string;
@@ -74,7 +70,6 @@ describe('Audit History (Integration)', () => {
     const update = res.body.find((e: any) => e.action === 'UPDATED');
     expect(update).toBeDefined();
 
-    // The whole point: previous must show the OLD values, not a copy of the new ones.
     expect(prodEnv(update.previousValue)).toMatchObject({
       isEnabled: false,
       rolloutPercentage: 10,
@@ -98,7 +93,6 @@ describe('Audit History (Integration)', () => {
       expect(entry.createdAt).toBeTruthy();
     }
 
-    // Newest first — the endpoint is for "what changed recently".
     const times = res.body.map((e: any) => new Date(e.createdAt).getTime());
     expect([...times].sort((a, b) => b - a)).toEqual(times);
   });

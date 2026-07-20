@@ -10,7 +10,7 @@ export class CorrelationIdMiddleware implements NestMiddleware {
       (req.headers['x-correlation-id'] as string) || uuidv4();
     req['correlationId'] = correlationId;
     res.setHeader('x-correlation-id', correlationId);
-    // Run the rest of the request inside an ALS store so logs can read the id.
+
     requestContext.run({ correlationId }, () => next());
   }
 }

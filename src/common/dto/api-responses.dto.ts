@@ -3,13 +3,6 @@ import { FlagType } from '../../flags/entities/feature-flag.entity';
 import { Environment } from '../../flags/entities/flag-environment.entity';
 import { VariantDto } from '../../flags/dto/create-flag.dto';
 
-/**
- * Response shapes, declared solely so the OpenAPI document describes what callers actually
- * receive. The entities are not reused directly here: they carry relation properties and
- * `select: false` credential columns that are deliberately never serialised, and exposing
- * an ORM entity as an API contract makes every schema change an accidental API change.
- */
-
 export class ErrorResponseDto {
   @ApiProperty({ example: 400 })
   statusCode: number;
@@ -28,8 +21,6 @@ export class ErrorResponseDto {
   error: string;
 }
 
-// ─── Tenants ────────────────────────────────────────────────────────────────────
-
 export class CreateTenantResponseDto {
   @ApiProperty({ format: 'uuid' })
   id: string;
@@ -43,8 +34,7 @@ export class CreateTenantResponseDto {
   @ApiProperty({
     description:
       'The plaintext API key. Returned ONCE, at creation, and never retrievable again — only a bcrypt hash is stored.',
-    // Deliberately not a real key shape from any environment — documentation examples get
-    // copied, indexed and screenshotted, so they should never be a credential that existed.
+
     example: 'ffs_EXAMPLE0000000000000000000000',
   })
   apiKey: string;
@@ -81,8 +71,6 @@ export class TenantDto {
   updatedAt: string;
 }
 
-// ─── Flags ──────────────────────────────────────────────────────────────────────
-
 export class FlagEnvironmentDto {
   @ApiProperty({ format: 'uuid' })
   id: string;
@@ -105,8 +93,6 @@ export class FlagEnvironmentDto {
   @ApiProperty({ type: 'object', additionalProperties: true, example: {} })
   targeting: Record<string, any>;
 
-  // Explicit array type: TypeScript reflection collapses the `Array | null` union to
-  // Object, which produced a schema declaring an object while the example was an array.
   @ApiProperty({
     type: [VariantDto],
     nullable: true,
@@ -132,8 +118,6 @@ export class FeatureFlagDto {
   @ApiProperty({ example: 'New Checkout Flow' })
   name: string;
 
-  // `type: String` is required. TypeScript's emitted metadata for a `string | null` union
-  // is Object, so without it the schema declares an object while the API returns a string.
   @ApiPropertyOptional({ type: String, nullable: true })
   description: string | null;
 
@@ -167,8 +151,6 @@ export class FeatureFlagDto {
   @ApiProperty({ format: 'date-time' })
   updatedAt: string;
 }
-
-// ─── Evaluation ─────────────────────────────────────────────────────────────────
 
 export enum EvaluationReason {
   ENABLED = 'ENABLED',
@@ -206,8 +188,6 @@ export class BulkEvaluationResponseDto {
   count: number;
 }
 
-// ─── Audit ──────────────────────────────────────────────────────────────────────
-
 export class AuditLogDto {
   @ApiProperty({ format: 'uuid' })
   id: string;
@@ -215,7 +195,6 @@ export class AuditLogDto {
   @ApiProperty({ format: 'uuid' })
   tenantId: string;
 
-  // See the note on FeatureFlagDto.description — a nullable union needs an explicit type.
   @ApiPropertyOptional({ type: String, format: 'uuid', nullable: true })
   flagId: string | null;
 
@@ -255,8 +234,6 @@ export class AuditLogDto {
   @ApiProperty({ format: 'date-time' })
   createdAt: string;
 }
-
-// ─── Health ─────────────────────────────────────────────────────────────────────
 
 export class HealthResponseDto {
   @ApiProperty({ enum: ['ok', 'error'], example: 'ok' })

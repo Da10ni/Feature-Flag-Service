@@ -23,8 +23,6 @@ variable "peering_address" {
   EOT
 }
 
-# Cloud Run is serverless and has no VPC presence of its own; the connector is what lets it
-# reach Cloud SQL and Memorystore over private IP, so neither has to be exposed publicly.
 resource "google_compute_network" "main" {
   name                    = "${var.name_prefix}-vpc"
   auto_create_subnetworks = false
@@ -37,19 +35,6 @@ resource "google_compute_subnetwork" "main" {
   network       = google_compute_network.main.id
 }
 
-# NOTE: there is deliberately no google_vpc_access_connector here.
-#
-# Cloud Run reaches this VPC through Direct VPC egress (see modules/service), attaching
-# straight to the subnet above. The older Serverless VPC Access connector would put a
-# managed instance group of proxy VMs in the path, which costs roughly $20/month per
-# environment, adds a hop, and forces the subnet to be exactly /28.
-#
-# It also failed repeatedly here: a connector that errors during creation leaves its VMs
-# holding the subnet, so the subnet can no longer be modified or destroyed until the
-# half-built connector is manually deleted. Direct egress has no such appliance to strand.
-
-# Reserved range that Google's service producers (Cloud SQL, Memorystore) peer into.
-# The address is pinned (see variable docs) so it can never overlap the subnet above.
 resource "google_compute_global_address" "private_ip_range" {
   name          = "${var.name_prefix}-private-ip"
   purpose       = "VPC_PEERING"
@@ -67,8 +52,6 @@ resource "google_service_networking_connection" "private_vpc_connection" {
 
 output "network_id" { value = google_compute_network.main.id }
 output "subnetwork_id" { value = google_compute_subnetwork.main.id }
-# Downstream modules depend on this so Cloud SQL / Redis are never created before the
-# peering exists — without it the first apply fails with an unhelpful IP allocation error.
 output "private_vpc_connection" {
   value = google_service_networking_connection.private_vpc_connection.id
 }

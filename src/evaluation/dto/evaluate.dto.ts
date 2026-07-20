@@ -10,8 +10,6 @@ import { Expose, Transform } from 'class-transformer';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { Environment } from '../../flags/entities/flag-environment.entity';
 
-// The spec documents this body as snake_case ({ tenant_id, environment, user_id, context }).
-// We accept both that and camelCase so either client shape works.
 const alias = (snake: string) =>
   Transform(
     ({ obj, value }: { obj: Record<string, unknown>; value: unknown }) =>
@@ -25,8 +23,6 @@ export class EvaluateDto {
     enumName: 'Environment',
     example: Environment.PRODUCTION,
   })
-  // Validated as an enum, not a bare string: a typo'd environment must 400 rather than
-  // silently miss every env config and report every flag as disabled.
   @IsEnum(Environment)
   environment: Environment;
 
@@ -49,8 +45,6 @@ export class EvaluateDto {
       'Optional. The tenant is always derived from the API key; if supplied this is only cross-checked against it and returns 403 on mismatch. It is never trusted as the source of tenant identity. Also accepted as `tenantId`.',
     example: 'a1b2c3d4-e5f6-7890-abcd-ef1234567890',
   })
-  // Optional, and only ever cross-checked against the API key's tenant — never trusted
-  // as the source of tenant identity. Isolation comes from the key alone.
   @Expose()
   @alias('tenant_id')
   @IsOptional()

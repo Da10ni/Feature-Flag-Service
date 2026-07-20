@@ -15,15 +15,6 @@ import { ApiPropertyOptional } from '@nestjs/swagger';
 import { Environment } from '../entities/flag-environment.entity';
 import { VariantDto } from './create-flag.dto';
 
-/**
- * Every field is optional — send only what changes.
- *
- * The fields split into two groups. `name`, `description` and `defaultValue` belong to the
- * flag itself and apply everywhere. `isEnabled`, `rolloutPercentage`, `targeting` and
- * `variants` are per-environment and only take effect when `environment` is also supplied:
- * without it the service cannot know which of the three configurations to change, so it
- * leaves them alone rather than guessing.
- */
 export class UpdateFlagDto {
   @ApiPropertyOptional({
     description: 'New human-readable name. Applies across all environments.',
@@ -58,8 +49,6 @@ export class UpdateFlagDto {
     example: Environment.PRODUCTION,
   })
   @IsOptional()
-  // Enum, not a bare string: an unrecognised environment matched no configuration and the
-  // update silently became a no-op while still returning 200. Now it is rejected as a 400.
   @IsEnum(Environment)
   environment?: Environment;
 

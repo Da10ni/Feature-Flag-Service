@@ -33,7 +33,6 @@ export class EvaluationService {
     private metrics: MetricsService,
   ) {}
 
-  // Deterministic hash: maps salt+flagKey+userId to 0-99.
   private computeHash(salt: string, flagKey: string, userId: string): number {
     const hash = createHash('sha256')
       .update(`${salt}:${flagKey}:${userId}`)
@@ -42,21 +41,6 @@ export class EvaluationService {
     return value % 100;
   }
 
-  /**
-   * Loads a tenant's active flag definitions for one environment, through Redis.
-   *
-   * The cache holds flag DEFINITIONS, not per-user evaluation results. Caching results
-   * keyed by user gives a hit rate equal to how often the same user recurs — for a service
-   * called once per end-user request that is close to zero, so nearly every request falls
-   * through to a joined Postgres query and the cache earns nothing while still costing a
-   * round trip. It also makes invalidation expensive: clearing one flag means scanning for
-   * every user's key.
-   *
-   * Definitions are the opposite: a handful of rows per tenant, read constantly, changed
-   * rarely. One entry serves every user, so the hit rate approaches 100% regardless of user
-   * cardinality, and invalidation is a single DEL. Evaluation itself is then pure CPU — a
-   * SHA-256 hash — which is microseconds and needs no cache at all.
-   */
   private async loadFlags(
     tenantId: string,
     environment: Environment,
@@ -74,8 +58,6 @@ export class EvaluationService {
       relations: { environments: true },
     });
 
-    // Keep only the environment being evaluated: it is the only one this key serves, and
-    // it keeps the cached payload small.
     const scoped = flags.map((flag) => ({
       ...flag,
       environments: flag.environments.filter(
@@ -83,9 +65,6 @@ export class EvaluationService {
       ),
     })) as FeatureFlag[];
 
-    // Short TTL as a backstop only — writes invalidate explicitly (see FlagsService), so
-    // this bounds staleness if an invalidation is ever lost rather than being the primary
-    // freshness mechanism.
     await this.redisService.set(cacheKey, JSON.stringify(scoped), 60);
     return scoped;
   }
@@ -110,7 +89,6 @@ export class EvaluationService {
   }
 
   async evaluateBulk(ctx: EvaluationContext): Promise<EvaluationResult[]> {
-    // One cache read for the whole set, then N in-memory evaluations — no per-flag I/O.
     const flags = await this.loadFlags(ctx.tenantId, ctx.environment);
 
     return flags.map((flag) => {

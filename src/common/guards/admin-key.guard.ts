@@ -8,18 +8,6 @@ import {
 import { ConfigService } from '@nestjs/config';
 import { timingSafeEqual } from 'crypto';
 
-// Guards tenant registration. Tenant creation mints an API key, so on a public Cloud Run
-// URL an open endpoint lets anyone provision themselves credentials.
-//
-// Opt-in outside production: with ADMIN_API_KEY unset the guard is a no-op, so local dev,
-// docker compose and CI need no extra config. Terraform sets the variable from Secret
-// Manager in staging and production.
-//
-// In production an unset key is treated as a misconfiguration, not as "open": if the
-// Secret Manager wiring ever breaks, failing open would silently turn credential minting
-// into a public endpoint with the service still reporting healthy. Only this endpoint is
-// refused — evaluation is the hot path clients depend on, so a bad admin key must not
-// become a full outage.
 @Injectable()
 export class AdminKeyGuard implements CanActivate {
   constructor(private config: ConfigService) {}
@@ -46,8 +34,6 @@ export class AdminKeyGuard implements CanActivate {
   }
 }
 
-// Constant-time compare so a wrong key can't be recovered byte-by-byte from timing.
-// Length is compared first because timingSafeEqual throws on a length mismatch.
 function safeEqual(a: string, b: string): boolean {
   const bufA = Buffer.from(a);
   const bufB = Buffer.from(b);

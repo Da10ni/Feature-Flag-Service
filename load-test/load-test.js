@@ -2,19 +2,6 @@ import http from 'k6/http';
 import { check, sleep } from 'k6';
 import { Rate, Trend, Counter } from 'k6/metrics';
 
-/**
- * Load test for the flag evaluation endpoints.
- *
- * Spreads load across several tenants rather than hammering one. That is not incidental:
- * the service enforces a PER-TENANT rate limit, so a single-tenant test at a few hundred
- * rps measures the throttler, not the evaluation engine — it reports ~80% errors while the
- * service is behaving exactly as designed. Driving N tenants concurrently is also the
- * realistic shape for a multi-tenant platform, and it exercises tenant isolation under load.
- *
- * Throttled responses are counted separately from real failures, so a 429 is never silently
- * scored as a service error.
- */
-
 const errorRate = new Rate('errors');
 const evalLatency = new Trend('evaluation_latency', true);
 const throttled = new Counter('throttled_429');
@@ -41,8 +28,6 @@ function headers(apiKey) {
   return { headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey } };
 }
 
-// Runs once before the load phase: provisions the tenants and the flag under test, so the
-// script is self-contained and doesn't depend on hand-seeded data.
 export function setup() {
   const adminHeaders = { 'Content-Type': 'application/json' };
   if (ADMIN_KEY) adminHeaders['x-admin-key'] = ADMIN_KEY;
@@ -67,8 +52,7 @@ export function setup() {
         name: 'Load Test Flag',
         type: 'string',
         defaultValue: 'off',
-        // A partial rollout with variants exercises both hash paths per evaluation,
-        // so the numbers reflect the real cost of the engine rather than a trivial lookup.
+
         environments: [
           {
             environment: 'production',
@@ -92,7 +76,6 @@ export function setup() {
 }
 
 export default function (data) {
-  // Each VU sticks to one tenant, so load divides evenly across tenants.
   const apiKey = data.keys[__VU % data.keys.length];
   const params = headers(apiKey);
   const userId = `user-${Math.floor(Math.random() * 100000)}`;

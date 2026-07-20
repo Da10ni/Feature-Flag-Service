@@ -40,10 +40,6 @@ locals {
   channels = var.alert_email == "" ? [] : [google_monitoring_notification_channel.email[0].id]
 }
 
-# --- Alert: error rate > 5% over 5 minutes ----------------------------------------------
-# MQL rather than a threshold condition because the requirement is a RATIO (5xx / all).
-# A plain threshold on 5xx/sec would page during harmless low-traffic blips and stay quiet
-# during a real outage at low volume.
 resource "google_monitoring_alert_policy" "error_rate" {
   display_name = "${var.name_prefix} - Error Rate > 5%"
   combiner     = "OR"
@@ -70,10 +66,6 @@ resource "google_monitoring_alert_policy" "error_rate" {
   alert_strategy { auto_close = "604800s" }
 }
 
-# --- Alert: flag evaluation latency ------------------------------------------------------
-# Alerts on the application's own histogram (via Managed Prometheus), not Cloud Run's
-# request latency — the spec asks specifically for evaluation latency, and request latency
-# would hide a slow evaluation behind fast health checks and CRUD calls.
 resource "google_monitoring_alert_policy" "eval_latency" {
   count        = var.enable_custom_metric_alerts ? 1 : 0
   display_name = "${var.name_prefix} - Flag Evaluation p95 Latency"
@@ -99,7 +91,6 @@ resource "google_monitoring_alert_policy" "eval_latency" {
   alert_strategy { auto_close = "604800s" }
 }
 
-# --- Uptime check + health alert ---------------------------------------------------------
 resource "google_monitoring_uptime_check_config" "health" {
   display_name = "${var.name_prefix} - Health"
   timeout      = "10s"
@@ -144,8 +135,6 @@ resource "google_monitoring_alert_policy" "health_check" {
   alert_strategy { auto_close = "604800s" }
 }
 
-# --- Dashboard ---------------------------------------------------------------------------
-# The four metrics the spec calls out, plus instance count for capacity context.
 resource "google_monitoring_dashboard" "main" {
   dashboard_json = jsonencode({
     displayName = "${var.name_prefix} - Overview"

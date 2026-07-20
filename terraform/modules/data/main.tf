@@ -10,10 +10,6 @@ locals {
   is_production = var.environment == "production"
 }
 
-# --- Cloud SQL (PostgreSQL) -------------------------------------------------------------
-# Chosen over self-managed Postgres for automated backups, patching and failover. REGIONAL
-# in production gives a synchronous standby in a second zone; staging stays ZONAL to keep
-# the bill down, since a staging outage costs nothing but time.
 resource "google_sql_database_instance" "main" {
   name                = "${var.name_prefix}-postgres"
   database_version    = "POSTGRES_16"
@@ -31,7 +27,6 @@ resource "google_sql_database_instance" "main" {
       point_in_time_recovery_enabled = local.is_production
     }
 
-    # No public IP: the only route in is the VPC, via the Cloud Run connector.
     ip_configuration {
       ipv4_enabled    = false
       private_network = var.network_id
@@ -57,9 +52,6 @@ resource "google_sql_user" "user" {
   password = random_password.db_password.result
 }
 
-# --- Memorystore (Redis) ----------------------------------------------------------------
-# Caches evaluated flag results. STANDARD_HA in production so a node failure doesn't dump
-# the whole cache onto Postgres at once; BASIC is fine for staging.
 resource "google_redis_instance" "main" {
   name               = "${var.name_prefix}-redis"
   tier               = local.is_production ? "STANDARD_HA" : "BASIC"
@@ -73,9 +65,6 @@ resource "google_redis_instance" "main" {
   depends_on = [var.private_vpc_connection]
 }
 
-# --- Secrets ----------------------------------------------------------------------------
-# The generated DB password is never written to a tfvars file or a plain env var; Cloud Run
-# reads it from Secret Manager at start-up via secret_key_ref.
 resource "google_secret_manager_secret" "db_password" {
   secret_id = "${var.name_prefix}-db-password"
   replication {
@@ -88,8 +77,6 @@ resource "google_secret_manager_secret_version" "db_password" {
   secret_data = random_password.db_password.result
 }
 
-# Guards tenant registration on a publicly reachable service. Generated here rather than
-# supplied so the plaintext never leaves GCP.
 resource "random_password" "admin_api_key" {
   length  = 40
   special = false

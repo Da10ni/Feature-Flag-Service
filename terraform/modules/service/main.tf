@@ -28,12 +28,7 @@ locals {
   is_production = var.environment == "production"
 }
 
-# --- Least-privilege identity -----------------------------------------------------------
-# A dedicated SA per environment: staging credentials can never reach the production
-# database, and the roles below are the complete set the service needs.
 resource "google_service_account" "run" {
-  # account_id is capped at 30 chars by GCP, so this uses the short prefix. The readable
-  # name still shows up in the console via display_name.
   account_id   = "${var.short_prefix}-sa"
   display_name = "${var.name_prefix} Cloud Run"
 }
@@ -44,7 +39,6 @@ resource "google_project_iam_member" "sql_client" {
   member  = "serviceAccount:${google_service_account.run.email}"
 }
 
-# Scoped to the individual secrets, not project-wide secretAccessor.
 resource "google_secret_manager_secret_iam_member" "db_password" {
   secret_id = var.db_password_secret_name
   role      = "roles/secretmanager.secretAccessor"
@@ -57,7 +51,6 @@ resource "google_secret_manager_secret_iam_member" "admin_key" {
   member    = "serviceAccount:${google_service_account.run.email}"
 }
 
-# Lets the Managed Prometheus sidecar ship scraped custom metrics to Cloud Monitoring.
 resource "google_project_iam_member" "metric_writer" {
   project = var.project_id
   role    = "roles/monitoring.metricWriter"
@@ -71,7 +64,6 @@ resource "google_cloud_run_v2_service" "main" {
   template {
     service_account = google_service_account.run.email
 
-    # Tells the GMP sidecar which endpoint on the app container to scrape.
     annotations = {
       "run.googleapis.com/gmp-config" = jsonencode({
         scrape_configs = [{
@@ -83,19 +75,11 @@ resource "google_cloud_run_v2_service" "main" {
       })
     }
 
-    # Production keeps warm instances: a cold start pays Nest bootstrap plus the migration
-    # lock check, which is far too slow for a latency-sensitive evaluation endpoint.
     scaling {
       min_instance_count = var.min_instances
       max_instance_count = var.max_instances
     }
 
-    # Direct VPC egress: Cloud Run attaches straight to the subnet, with no Serverless VPC
-    # Access connector in the path. Fewer moving parts than a connector, ~$20/month cheaper
-    # per environment, and nothing to strand if a deploy fails mid-way.
-    #
-    # PRIVATE_RANGES_ONLY keeps only RFC1918 traffic on the VPC, so reaching Cloud SQL and
-    # Memorystore goes private while ordinary outbound internet still uses the default path.
     vpc_access {
       network_interfaces {
         network    = var.network_id
@@ -150,7 +134,6 @@ resource "google_cloud_run_v2_service" "main" {
         value = tostring(var.redis_port)
       }
 
-      # Secrets are mounted from Secret Manager, never inlined as plaintext env values.
       env {
         name = "DB_PASSWORD"
         value_source {
@@ -170,8 +153,6 @@ resource "google_cloud_run_v2_service" "main" {
         }
       }
 
-      # /health returns 503 when Postgres is unreachable, so these probes and the canary
-      # gate in CI all fail closed on a broken dependency rather than serving errors.
       startup_probe {
         http_get {
           path = "/api/v1/health"
@@ -193,8 +174,6 @@ resource "google_cloud_run_v2_service" "main" {
       }
     }
 
-    # Managed Service for Prometheus sidecar — scrapes /api/v1/metrics and forwards the
-    # custom metrics (eval latency, cache hit ratio, per-tenant rates) to Cloud Monitoring.
     containers {
       name  = "collector"
       image = "us-docker.pkg.dev/cloud-ops-agents-artifacts/cloud-run-gmp-sidecar/cloud-run-gmp-sidecar:1.1.1"
@@ -206,9 +185,6 @@ resource "google_cloud_run_v2_service" "main" {
     percent = 100
   }
 
-  # Traffic split and image tag are owned by the deploy pipeline. Without this, any
-  # `terraform apply` during a canary would yank 100% of traffic to the newest revision
-  # and silently undo the rollout.
   lifecycle {
     ignore_changes = [
       traffic,

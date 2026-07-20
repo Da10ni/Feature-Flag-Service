@@ -1,13 +1,9 @@
 import { MigrationInterface, QueryRunner } from 'typeorm';
 
-// Baseline schema: tenants → feature_flags → flag_environments, plus the append-only
-// audit_logs table. Mirrors the entity definitions exactly; `synchronize` produces this
-// same shape in local dev, and production applies it through this migration instead.
 export class InitialSchema1750000000000 implements MigrationInterface {
   name = 'InitialSchema1750000000000';
 
   public async up(queryRunner: QueryRunner): Promise<void> {
-    // gen_random_uuid() lives here on PG13+; pgcrypto keeps older instances working.
     await queryRunner.query(`CREATE EXTENSION IF NOT EXISTS "pgcrypto"`);
 
     await queryRunner.query(`
@@ -25,7 +21,7 @@ export class InitialSchema1750000000000 implements MigrationInterface {
         CONSTRAINT "UQ_tenants_slug" UNIQUE ("slug")
       )
     `);
-    // Every authenticated request hits this index once — it is the hot path for auth.
+
     await queryRunner.query(
       `CREATE INDEX "IDX_tenants_api_key_lookup" ON "tenants" ("api_key_lookup")`,
     );
@@ -52,8 +48,7 @@ export class InitialSchema1750000000000 implements MigrationInterface {
           FOREIGN KEY ("tenant_id") REFERENCES "tenants"("id") ON DELETE CASCADE
       )
     `);
-    // Unique per tenant, not globally — two tenants may both own a flag named "new-checkout".
-    // This is the constraint that makes flag_key a safe tenant-scoped identifier in URLs.
+
     await queryRunner.query(
       `CREATE UNIQUE INDEX "IDX_feature_flags_tenant_key" ON "feature_flags" ("tenant_id", "flag_key")`,
     );
@@ -78,7 +73,6 @@ export class InitialSchema1750000000000 implements MigrationInterface {
       `CREATE UNIQUE INDEX "IDX_flag_environments_flag_env" ON "flag_environments" ("flag_id", "environment")`,
     );
 
-    // Append-only: no updated_at, and nothing in the app ever issues UPDATE or DELETE here.
     await queryRunner.query(`
       CREATE TABLE "audit_logs" (
         "id"             uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -92,7 +86,7 @@ export class InitialSchema1750000000000 implements MigrationInterface {
         "created_at"     TIMESTAMP NOT NULL DEFAULT now()
       )
     `);
-    // Serves the history endpoint: filter by (tenant, flag) then order by time.
+
     await queryRunner.query(
       `CREATE INDEX "IDX_audit_logs_tenant_flag" ON "audit_logs" ("tenant_id", "flag_key")`,
     );

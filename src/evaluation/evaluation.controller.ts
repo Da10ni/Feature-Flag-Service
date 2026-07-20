@@ -30,7 +30,6 @@ import {
   ErrorResponseDto,
 } from '../common/dto/api-responses.dto';
 
-// tenantId comes from the authenticated API key, never the request body — that's what enforces isolation.
 @ApiTags('Evaluation')
 @ApiSecurity('api-key')
 @ApiUnauthorizedResponse({
@@ -108,8 +107,6 @@ export class EvaluationController {
     return { flags: results, count: results.length };
   }
 
-  // The tenant always comes from the API key. A tenant_id in the body is accepted
-  // (the spec documents it) but only ever checked for agreement — never trusted.
   private scope(dto: EvaluateDto, tenant: Tenant) {
     if (dto.tenantId && dto.tenantId !== tenant.id) {
       throw new ForbiddenException(

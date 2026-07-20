@@ -1,11 +1,3 @@
-/**
- * Resources shared by every environment. Applied once, before either env root.
- *
- * Artifact Registry lives here rather than per-environment so that the image validated in
- * staging is bit-for-bit the image promoted to production. A per-environment registry would
- * force a rebuild between the two, and a rebuild is a different artifact — which defeats the
- * point of having a staging environment at all.
- */
 terraform {
   required_version = ">= 1.5"
   required_providers {
@@ -15,8 +7,6 @@ terraform {
     }
   }
 
-  # Bucket supplied at init (GCS names are globally unique):
-  #   terraform init -backend-config="bucket=$PROJECT_ID-tfstate"
   backend "gcs" {
     prefix = "terraform/state/shared"
   }
