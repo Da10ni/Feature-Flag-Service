@@ -1,0 +1,1596 @@
+{
+  "openapi": "3.0.0",
+  "paths": {
+    "/api/v1/metrics": {
+      "get": {
+        "description": "Exposes application metrics in Prometheus text format. In GCP the Managed Service for Prometheus sidecar scrapes this and forwards to Cloud Monitoring, which is what \"custom metrics exported to Cloud Monitoring\" means here — no per-request write API calls.\n\nExported series:\n- `flag_evaluation_duration_seconds` — histogram, labelled by tenant and flag type. Yields p50/p95/p99.\n- `flag_evaluations_total` — counter by tenant; `rate()` gives evaluations per second per tenant.\n- `flag_evaluation_cache_total` — counter labelled `hit` / `miss` for the cache hit ratio.\n- `http_request_duration_seconds` — histogram by method, route, status and tenant. Yields error rate per tenant and endpoint.\n- Plus Node.js default process metrics.\n\nThe `route` label is the route pattern (`/tenants/:tenantId/flags`), never the raw URL, so cardinality does not grow with the number of tenants.\n\nRequires no authentication.",
+        "operationId": "MetricsController_scrape",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "Metrics in Prometheus exposition format.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                },
+                "example": "# HELP flag_evaluations_total Total flag evaluations\n# TYPE flag_evaluations_total counter\nflag_evaluations_total{tenant=\"a1b2c3d4-...\",type=\"boolean\"} 42\n"
+              }
+            }
+          }
+        },
+        "summary": "Prometheus metrics scrape endpoint",
+        "tags": [
+          "Operations"
+        ],
+        "security": []
+      }
+    },
+    "/api/v1/tenants": {
+      "post": {
+        "description": "Creates a tenant (an application) and mints its API key. The key is returned exactly once and cannot be retrieved afterwards — only a bcrypt hash is stored.\n\nGuarded by the `x-admin-key` header whenever `ADMIN_API_KEY` is configured. It is unset locally and in CI, so the guard is a no-op there; Terraform sets it from Secret Manager in staging and production, where the service is publicly reachable and an open registration endpoint would let anyone provision themselves credentials.",
+        "operationId": "TenantsController_create",
+        "parameters": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateTenantDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Tenant created. Store `apiKey` now — it is not shown again.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateTenantResponseDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Validation failed (e.g. slug is not lowercase-alphanumeric).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponseDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid `x-admin-key` (when admin auth is enabled).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponseDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A tenant with this name or slug already exists.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponseDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "admin-key": []
+          }
+        ],
+        "summary": "Register a new tenant",
+        "tags": [
+          "Tenants"
+        ]
+      }
+    },
+    "/api/v1/tenants/me": {
+      "get": {
+        "description": "There is deliberately no endpoint that lists all tenants: it is not required, and on a public URL it would enumerate every tenant on the platform. API key material (`apiKeyHash`, `apiKeyLookup`) is marked `select: false` on the entity and never appears in any response.",
+        "operationId": "TenantsController_me",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "The authenticated tenant.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TenantDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid `x-api-key`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponseDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "api-key": []
+          }
+        ],
+        "summary": "Get the tenant owning the presented API key",
+        "tags": [
+          "Tenants"
+        ]
+      }
+    },
+    "/api/v1/tenants/{tenantId}/flags": {
+      "post": {
+        "description": "Creates a flag and all three environment configurations at once. Environments omitted from `environments` default to disabled at 0% rollout, so a new flag is inert until explicitly turned on.\n\n`flagKey` is unique per tenant rather than globally, so two tenants may each own a flag called `new-checkout`.",
+        "operationId": "FlagsController_create",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Tenant that owns the flag. Must match the tenant behind the API key.",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateFlagDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Flag created.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FeatureFlagDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Validation failed (unknown flag type, variant weight out of range, …).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponseDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid `x-api-key`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponseDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The API key belongs to a different tenant than the `tenantId` in the path.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponseDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A flag with this key already exists for the tenant.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponseDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "api-key": []
+          }
+        ],
+        "summary": "Create a feature flag",
+        "tags": [
+          "Feature Flags"
+        ]
+      },
+      "get": {
+        "description": "Returns the tenant's flags. Filtering by `environment` narrows each flag's `environments` array to just that environment, which is the shape a single-environment dashboard wants.",
+        "operationId": "FlagsController_findAll",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Tenant that owns the flag. Must match the tenant behind the API key.",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment",
+            "required": false,
+            "in": "query",
+            "description": "Return only this environment's configuration for each flag. Omit for all three.",
+            "schema": {
+              "enum": [
+                "development",
+                "staging",
+                "production"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "name": "status",
+            "required": false,
+            "in": "query",
+            "description": "Filter by archive state. Omit to return both active and archived flags.",
+            "schema": {
+              "enum": [
+                "active",
+                "archived"
+              ],
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Matching flags.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/FeatureFlagDto"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid `x-api-key`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponseDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The API key belongs to a different tenant than the `tenantId` in the path.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponseDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "api-key": []
+          }
+        ],
+        "summary": "List feature flags",
+        "tags": [
+          "Feature Flags"
+        ]
+      }
+    },
+    "/api/v1/tenants/{tenantId}/flags/{flagKey}": {
+      "put": {
+        "description": "Partial update — send only the fields that change. Toggle, rollout percentage, targeting and variants are per-environment and require `environment` in the body; name, description and default value apply across all environments.\n\nEvery change is written to the append-only audit log with the full before and after state, and invalidates the tenant's evaluation cache so it takes effect on the very next evaluation.",
+        "operationId": "FlagsController_update",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Tenant that owns the flag. Must match the tenant behind the API key.",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "flagKey",
+            "required": true,
+            "in": "path",
+            "description": "Flag key.",
+            "schema": {
+              "example": "new-checkout-flow",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateFlagDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated flag.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FeatureFlagDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Validation failed — for example an unrecognised `environment` value.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponseDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid `x-api-key`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponseDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The API key belongs to a different tenant than the `tenantId` in the path.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponseDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such flag for this tenant.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponseDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "api-key": []
+          }
+        ],
+        "summary": "Update a flag",
+        "tags": [
+          "Feature Flags"
+        ]
+      },
+      "delete": {
+        "description": "Sets `isArchived`; the row is never removed. Archived flags stop being evaluated and drop out of `?status=active`, but stay readable via `?status=archived` and keep their full audit history — hard-deleting would destroy the compliance trail the audit log exists to provide.",
+        "operationId": "FlagsController_archive",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Tenant that owns the flag. Must match the tenant behind the API key.",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "flagKey",
+            "required": true,
+            "in": "path",
+            "description": "Flag key.",
+            "schema": {
+              "example": "legacy-banner",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Flag archived. No response body."
+          },
+          "401": {
+            "description": "Missing or invalid `x-api-key`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponseDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The API key belongs to a different tenant than the `tenantId` in the path.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponseDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such flag for this tenant.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponseDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "api-key": []
+          }
+        ],
+        "summary": "Archive a flag (soft delete)",
+        "tags": [
+          "Feature Flags"
+        ]
+      }
+    },
+    "/api/v1/evaluate": {
+      "post": {
+        "description": "Resolves one flag for one user in one environment.\n\n**Deterministic:** the same `user_id` always receives the same value for a given flag configuration. Bucketing is a SHA-256 hash of the flag key and user id mapped to 0–99, so no state is stored per user and any instance computes the same answer.\n\n**Tenant scoping:** the tenant comes from the API key. `tenant_id` in the body is optional and only cross-checked.\n\nReturns `200` with the resolved value; `reason` explains why, and is never masked by caching.",
+        "operationId": "EvaluationController_evaluate",
+        "parameters": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EvaluateDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Evaluated value.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvaluationResultDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`flag_key` is missing, or `environment` is not one of development / staging / production.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponseDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid `x-api-key`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponseDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "A `tenant_id` was supplied in the body and does not match the authenticated API key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponseDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No active flag with that key for this tenant.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponseDto"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Per-tenant rate limit exceeded. Limits are keyed on the API key so one tenant cannot consume another tenant's budget.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponseDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "api-key": []
+          }
+        ],
+        "summary": "Evaluate a single flag for a user",
+        "tags": [
+          "Evaluation"
+        ]
+      }
+    },
+    "/api/v1/evaluate/bulk": {
+      "post": {
+        "description": "Resolves all of the tenant's active (non-archived) flags for one user in a single call — the shape an SDK wants at client start-up.\n\n`flag_key` is ignored here. Archived flags are excluded.\n\nThis costs no more database round trips than a single evaluation: the tenant's flag definitions are fetched once from cache and every flag is then evaluated in memory.",
+        "operationId": "EvaluationController_evaluateBulk",
+        "parameters": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EvaluateDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "All active flags, evaluated for this user.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BulkEvaluationResponseDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`environment` is not one of development / staging / production, or `user_id` is missing.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponseDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid `x-api-key`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponseDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "A `tenant_id` was supplied in the body and does not match the authenticated API key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponseDto"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Per-tenant rate limit exceeded. Limits are keyed on the API key so one tenant cannot consume another tenant's budget.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponseDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "api-key": []
+          }
+        ],
+        "summary": "Evaluate every active flag for a user",
+        "tags": [
+          "Evaluation"
+        ]
+      }
+    },
+    "/api/v1/tenants/{tenantId}/flags/{flagKey}/history": {
+      "get": {
+        "description": "Chronological change history for one flag, newest first.\n\nEvery create, update and archive is recorded automatically with who changed it, when, and the complete flag state before and after. Records are append-only — nothing in the service ever issues an UPDATE or DELETE against this table, and archiving a flag preserves its history rather than removing it.",
+        "operationId": "AuditController_getHistory",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Must match the tenant behind the API key.",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "flagKey",
+            "required": true,
+            "in": "path",
+            "description": "Flag key.",
+            "schema": {
+              "example": "new-checkout-flow",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Audit entries, newest first. Empty array if the flag has no history or does not exist.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/AuditLogDto"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid `x-api-key`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponseDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The API key belongs to a different tenant.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponseDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "api-key": []
+          }
+        ],
+        "summary": "Get a flag's change history",
+        "tags": [
+          "Audit"
+        ]
+      }
+    },
+    "/api/v1/sse/flags": {
+      "get": {
+        "description": "Long-lived `text/event-stream` connection. Every flag create, update or archive for the authenticated tenant is pushed to connected subscribers immediately, so clients can react without polling.\n\n**Tenant scoping is enforced by the API key, not by a query parameter** — a subscriber can only ever receive its own tenant's events, and there is no parameter that could be tampered with to widen that.\n\nEach message is an SSE `data:` frame containing JSON: `{ tenantId, flagKey, action, environment?, flag? }` where `action` is `CREATED`, `UPDATED` or `ARCHIVED`.\n\nNote: events are delivered from the in-process emitter of the instance holding the connection. With multiple Cloud Run instances a subscriber receives changes made on its own instance; see \"Future Improvements\" in the README for the shared pub/sub upgrade.\n\nTry-it-out in Swagger UI does not render streaming responses — use `curl -N`.",
+        "operationId": "SseController_streamFlagChanges",
+        "parameters": [
+          {
+            "name": "environment",
+            "required": false,
+            "in": "query",
+            "description": "Only receive events for this environment. Omit to receive events for all environments.",
+            "schema": {
+              "enum": [
+                "development",
+                "staging",
+                "production"
+              ],
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "An open SSE stream of flag-change events.",
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                },
+                "example": "data: {\"tenantId\":\"a1b2c3d4-e5f6-7890-abcd-ef1234567890\",\"flagKey\":\"new-checkout-flow\",\"action\":\"UPDATED\",\"environment\":\"production\"}\n\n"
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid `x-api-key`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponseDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "api-key": []
+          }
+        ],
+        "summary": "Subscribe to flag changes (Server-Sent Events)",
+        "tags": [
+          "Real-Time"
+        ]
+      }
+    },
+    "/api/v1/health": {
+      "get": {
+        "description": "Verifies the service can reach PostgreSQL, then reports the result **through the status code**, not just the body.\n\nThat distinction matters: the Cloud Run liveness probe, the Cloud Monitoring uptime check, and the CI canary gate that rolls back a bad deploy all key off the status code. Returning `200` with `{\"status\":\"error\"}` would make every one of them read a broken service as healthy.\n\nRequires no authentication.",
+        "operationId": "HealthController_check",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "Service is healthy and the database is reachable.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponseDto"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The database is unreachable. Probes and the deploy gate treat this as a failure.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponseDto"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Liveness / readiness check",
+        "tags": [
+          "Operations"
+        ],
+        "security": []
+      }
+    }
+  },
+  "info": {
+    "title": "Multi-Tenant Feature Flag Service",
+    "description": "A multi-tenant configuration and feature flag service — a simplified LaunchDarkly.\n\n### Authentication\n\nTwo credentials exist, and they are not interchangeable:\n\n| Header | Used by | Obtained from |\n|---|---|---|\n| `x-api-key` | Everything scoped to a tenant | Returned once when the tenant is registered |\n| `x-admin-key` | Tenant registration only | Generated by Terraform, stored in Secret Manager |\n\nThe tenant is **always** derived from the API key, never from the request body or URL.\nA `tenantId` in a path is checked for agreement with the key and returns `403` on mismatch;\na `tenant_id` in an evaluation body is treated the same way. This is what enforces tenant\nisolation — there is no request field a caller can change to reach another tenant's data.\n\n`ADMIN_API_KEY` is unset locally and in CI, so the admin guard is a no-op there.\n\n### Determinism\n\nPercentage rollouts are deterministic. The same `user_id` always receives the same value\nfor a given flag configuration, because bucketing is a SHA-256 hash of the flag key and\nuser id mapped to 0–99 rather than stored state. Any instance computes the same answer,\nand no sticky sessions are required.\n\nRollout gating and variant selection use **different salts**, so the two decisions are\nindependent. Sharing one hash would silently give every gated-in user the first variant.\n\n### Rate limiting\n\nLimits are per tenant, keyed on the API key, so one noisy tenant cannot consume another's\nbudget. Exceeding the limit returns `429`.",
+    "version": "1.0",
+    "contact": {}
+  },
+  "tags": [
+    {
+      "name": "Tenants",
+      "description": "Register tenants and inspect the authenticated tenant"
+    },
+    {
+      "name": "Feature Flags",
+      "description": "Create, list, update and archive flags"
+    },
+    {
+      "name": "Evaluation",
+      "description": "Resolve flag values for a user — the read-hot path of the service"
+    },
+    {
+      "name": "Audit",
+      "description": "Immutable, append-only change history"
+    },
+    {
+      "name": "Real-Time",
+      "description": "Server-Sent Events for live flag-change distribution"
+    },
+    {
+      "name": "Operations",
+      "description": "Health checks and Prometheus metrics"
+    }
+  ],
+  "servers": [
+    {
+      "url": "http://localhost:3000",
+      "description": "Local (Docker Compose)"
+    },
+    {
+      "url": "https://feature-flag-service-staging-dhqwxiey3q-uc.a.run.app",
+      "description": "Staging (Cloud Run)"
+    },
+    {
+      "url": "https://feature-flag-service-production-<hash>-uc.a.run.app",
+      "description": "Production (Cloud Run)"
+    }
+  ],
+  "components": {
+    "securitySchemes": {
+      "api-key": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "x-api-key",
+        "description": "Tenant API key, returned once at registration. Identifies the tenant for every scoped operation."
+      },
+      "admin-key": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "x-admin-key",
+        "description": "Platform admin key, required for tenant registration wherever ADMIN_API_KEY is configured. Read it with: gcloud secrets versions access latest --secret=feature-flag-service-<env>-admin-api-key"
+      }
+    },
+    "schemas": {
+      "CreateTenantDto": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Human-readable application name. Must be unique across the platform.",
+            "example": "Acme Corporation"
+          },
+          "slug": {
+            "type": "string",
+            "description": "URL-safe identifier. Lowercase alphanumeric and hyphens only. Must be unique.",
+            "example": "acme-corp",
+            "pattern": "^[a-z0-9-]+$"
+          },
+          "metadata": {
+            "type": "object",
+            "description": "Arbitrary key/value metadata stored against the tenant. Not interpreted by the service.",
+            "example": {
+              "team": "payments",
+              "costCentre": "CC-1042"
+            },
+            "additionalProperties": true
+          }
+        },
+        "required": [
+          "name",
+          "slug"
+        ]
+      },
+      "CreateTenantResponseDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "name": {
+            "type": "string",
+            "example": "Acme Corporation"
+          },
+          "slug": {
+            "type": "string",
+            "example": "acme-corp"
+          },
+          "apiKey": {
+            "type": "string",
+            "description": "The plaintext API key. Returned ONCE, at creation, and never retrievable again — only a bcrypt hash is stored.",
+            "example": "ffs_EXAMPLE0000000000000000000000"
+          },
+          "message": {
+            "type": "string",
+            "example": "Store this API key securely — it will not be shown again"
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "slug",
+          "apiKey",
+          "message",
+          "createdAt"
+        ]
+      },
+      "ErrorResponseDto": {
+        "type": "object",
+        "properties": {
+          "statusCode": {
+            "type": "number",
+            "example": 400
+          },
+          "message": {
+            "description": "Either a single message or, for validation failures, one entry per invalid field.",
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            ],
+            "example": [
+              "environment must be one of the following values: development, staging, production"
+            ]
+          },
+          "error": {
+            "type": "string",
+            "example": "Bad Request"
+          }
+        },
+        "required": [
+          "statusCode",
+          "message",
+          "error"
+        ]
+      },
+      "TenantDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "name": {
+            "type": "string",
+            "example": "Acme Corporation"
+          },
+          "slug": {
+            "type": "string",
+            "example": "acme-corp"
+          },
+          "isActive": {
+            "type": "boolean",
+            "example": true
+          },
+          "metadata": {
+            "type": "object",
+            "additionalProperties": true,
+            "example": {}
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updatedAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "slug",
+          "isActive",
+          "metadata",
+          "createdAt",
+          "updatedAt"
+        ]
+      },
+      "FlagType": {
+        "type": "string",
+        "enum": [
+          "boolean",
+          "string",
+          "number"
+        ],
+        "description": "Value type this flag resolves to."
+      },
+      "Environment": {
+        "type": "string",
+        "enum": [
+          "development",
+          "staging",
+          "production"
+        ],
+        "description": "Environment this configuration applies to."
+      },
+      "VariantDto": {
+        "type": "object",
+        "properties": {
+          "value": {
+            "description": "Value served when this variant is selected. Should match the flag type.",
+            "example": "treatment",
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "number"
+              },
+              {
+                "type": "boolean"
+              }
+            ]
+          },
+          "weight": {
+            "type": "number",
+            "description": "Share of the bucket space for this variant. Weights across all variants should total 100.",
+            "example": 50,
+            "minimum": 0,
+            "maximum": 100
+          }
+        },
+        "required": [
+          "value",
+          "weight"
+        ]
+      },
+      "EnvironmentConfigDto": {
+        "type": "object",
+        "properties": {
+          "environment": {
+            "description": "Environment this configuration applies to.",
+            "example": "production",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/Environment"
+              }
+            ]
+          },
+          "isEnabled": {
+            "type": "boolean",
+            "description": "Master on/off switch for this environment. When false the flag always resolves to defaultValue.",
+            "example": true,
+            "default": false
+          },
+          "rolloutPercentage": {
+            "type": "number",
+            "description": "Percentage of users receiving the enabled value. Membership is deterministic per user — see the evaluation algorithm in the README.",
+            "example": 25,
+            "minimum": 0,
+            "maximum": 100,
+            "default": 0
+          },
+          "targeting": {
+            "type": "object",
+            "description": "Reserved for attribute-based targeting rules. Accepted and persisted, not yet consulted during evaluation.",
+            "additionalProperties": true,
+            "example": {}
+          },
+          "variants": {
+            "description": "Weighted variants for A/B testing. String flags only. Variant selection is independent of rollout membership.",
+            "example": [
+              {
+                "value": "control",
+                "weight": 50
+              },
+              {
+                "value": "treatment",
+                "weight": 50
+              }
+            ],
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/VariantDto"
+            }
+          }
+        },
+        "required": [
+          "environment"
+        ]
+      },
+      "CreateFlagDto": {
+        "type": "object",
+        "properties": {
+          "flagKey": {
+            "type": "string",
+            "description": "Tenant-scoped identifier used in evaluation calls and URLs. Unique per tenant, not globally.",
+            "example": "new-checkout-flow"
+          },
+          "name": {
+            "type": "string",
+            "description": "Human-readable flag name.",
+            "example": "New Checkout Flow"
+          },
+          "description": {
+            "type": "string",
+            "description": "Free-text description of what the flag controls.",
+            "example": "Routes traffic to the rebuilt checkout funnel."
+          },
+          "type": {
+            "description": "Value type this flag resolves to.",
+            "example": "boolean",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/FlagType"
+              }
+            ]
+          },
+          "defaultValue": {
+            "description": "Value returned when the flag is disabled or the user falls outside the rollout. Should match `type`.",
+            "example": false,
+            "oneOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "string"
+              },
+              {
+                "type": "number"
+              }
+            ]
+          },
+          "environments": {
+            "description": "Per-environment configuration. All three environments are always created; any omitted here default to disabled at 0% rollout.",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/EnvironmentConfigDto"
+            }
+          }
+        },
+        "required": [
+          "flagKey",
+          "name",
+          "type",
+          "defaultValue"
+        ]
+      },
+      "FlagEnvironmentDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "flagId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The flag this configuration belongs to."
+          },
+          "environment": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/Environment"
+              }
+            ]
+          },
+          "isEnabled": {
+            "type": "boolean",
+            "example": true
+          },
+          "rolloutPercentage": {
+            "type": "number",
+            "example": 25,
+            "minimum": 0,
+            "maximum": 100
+          },
+          "targeting": {
+            "type": "object",
+            "additionalProperties": true,
+            "example": {}
+          },
+          "variants": {
+            "nullable": true,
+            "description": "Null when the flag has no variants configured.",
+            "example": [
+              {
+                "value": "control",
+                "weight": 50
+              },
+              {
+                "value": "treatment",
+                "weight": 50
+              }
+            ],
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/VariantDto"
+            }
+          }
+        },
+        "required": [
+          "id",
+          "flagId",
+          "environment",
+          "isEnabled",
+          "rolloutPercentage",
+          "targeting",
+          "variants"
+        ]
+      },
+      "FeatureFlagDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "tenantId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "flagKey": {
+            "type": "string",
+            "example": "new-checkout-flow"
+          },
+          "name": {
+            "type": "string",
+            "example": "New Checkout Flow"
+          },
+          "description": {
+            "type": "string",
+            "nullable": true
+          },
+          "type": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/FlagType"
+              }
+            ]
+          },
+          "defaultValue": {
+            "description": "Value returned when disabled or outside the rollout.",
+            "example": false,
+            "oneOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "string"
+              },
+              {
+                "type": "number"
+              }
+            ]
+          },
+          "isArchived": {
+            "type": "boolean",
+            "description": "Soft-delete marker. Archived flags are excluded from evaluation.",
+            "example": false
+          },
+          "environments": {
+            "description": "One entry per environment. Filtered to a single entry when the list endpoint is called with `?environment=`.",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FlagEnvironmentDto"
+            }
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updatedAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "required": [
+          "id",
+          "tenantId",
+          "flagKey",
+          "name",
+          "type",
+          "defaultValue",
+          "isArchived",
+          "environments",
+          "createdAt",
+          "updatedAt"
+        ]
+      },
+      "UpdateFlagDto": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "New human-readable name. Applies across all environments.",
+            "example": "New Checkout Flow (v2)"
+          },
+          "description": {
+            "type": "string",
+            "description": "New description. Applies across all environments.",
+            "example": "Rebuilt checkout funnel, now including express pay."
+          },
+          "defaultValue": {
+            "description": "New fallback value for disabled / not-in-rollout evaluations. Applies across all environments.",
+            "example": false,
+            "oneOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "string"
+              },
+              {
+                "type": "number"
+              }
+            ]
+          },
+          "environment": {
+            "description": "Environment to modify. REQUIRED for any of the per-environment fields below to take effect.",
+            "example": "production",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/Environment"
+              }
+            ]
+          },
+          "isEnabled": {
+            "type": "boolean",
+            "description": "Toggle the flag on or off in the given `environment`. Requires `environment`.",
+            "example": true
+          },
+          "rolloutPercentage": {
+            "type": "number",
+            "description": "New rollout percentage in the given `environment`. Requires `environment`. Users already inside the rollout remain inside when this increases.",
+            "example": 50,
+            "minimum": 0,
+            "maximum": 100
+          },
+          "targeting": {
+            "type": "object",
+            "description": "Targeting rules for the given `environment`. Requires `environment`.",
+            "additionalProperties": true,
+            "example": {}
+          },
+          "variants": {
+            "description": "Replacement variant set for the given `environment`. Requires `environment`. Re-weighting does not reshuffle who is inside the rollout.",
+            "example": [
+              {
+                "value": "control",
+                "weight": 30
+              },
+              {
+                "value": "treatment",
+                "weight": 70
+              }
+            ],
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/VariantDto"
+            }
+          }
+        }
+      },
+      "EvaluateDto": {
+        "type": "object",
+        "properties": {
+          "environment": {
+            "description": "Environment to evaluate against.",
+            "example": "production",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/Environment"
+              }
+            ]
+          },
+          "user_id": {
+            "type": "string",
+            "description": "Stable identifier for the end user being evaluated. Drives deterministic bucketing — the same user always receives the same value for a given flag configuration. Also accepted as `userId`.",
+            "example": "user-7a3f9b"
+          },
+          "tenant_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Optional. The tenant is always derived from the API key; if supplied this is only cross-checked against it and returns 403 on mismatch. It is never trusted as the source of tenant identity. Also accepted as `tenantId`.",
+            "example": "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+          },
+          "context": {
+            "type": "object",
+            "description": "Arbitrary user attributes. Accepted and reserved for attribute-based targeting; not yet consulted during evaluation.",
+            "additionalProperties": true,
+            "example": {
+              "country": "US",
+              "plan": "enterprise"
+            }
+          },
+          "flag_key": {
+            "type": "string",
+            "description": "Flag to evaluate. REQUIRED for POST /evaluate; ignored by POST /evaluate/bulk, which evaluates every active flag. Also accepted as `flagKey`.",
+            "example": "new-checkout-flow"
+          }
+        },
+        "required": [
+          "environment",
+          "user_id"
+        ]
+      },
+      "EvaluationReason": {
+        "type": "string",
+        "enum": [
+          "ENABLED",
+          "FLAG_DISABLED",
+          "NOT_IN_ROLLOUT",
+          "VARIANT_MATCH"
+        ],
+        "description": "Why the flag resolved this way. Always the real cause — a cache hit does not mask it, because the cache stores flag definitions rather than results."
+      },
+      "EvaluationResultDto": {
+        "type": "object",
+        "properties": {
+          "flagKey": {
+            "type": "string",
+            "example": "new-checkout-flow"
+          },
+          "value": {
+            "description": "Resolved value for this user. Type follows the flag type.",
+            "example": true,
+            "oneOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "string"
+              },
+              {
+                "type": "number"
+              }
+            ]
+          },
+          "reason": {
+            "description": "Why the flag resolved this way. Always the real cause — a cache hit does not mask it, because the cache stores flag definitions rather than results.",
+            "example": "ENABLED",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/EvaluationReason"
+              }
+            ]
+          }
+        },
+        "required": [
+          "flagKey",
+          "value",
+          "reason"
+        ]
+      },
+      "BulkEvaluationResponseDto": {
+        "type": "object",
+        "properties": {
+          "flags": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/EvaluationResultDto"
+            }
+          },
+          "count": {
+            "type": "number",
+            "description": "Number of flags evaluated.",
+            "example": 5
+          }
+        },
+        "required": [
+          "flags",
+          "count"
+        ]
+      },
+      "AuditLogDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "tenantId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "flagId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true
+          },
+          "flagKey": {
+            "type": "string",
+            "example": "new-checkout-flow"
+          },
+          "action": {
+            "type": "string",
+            "description": "What happened.",
+            "enum": [
+              "CREATED",
+              "UPDATED",
+              "ARCHIVED"
+            ],
+            "example": "UPDATED"
+          },
+          "changedBy": {
+            "type": "string",
+            "description": "Identity that made the change.",
+            "example": "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+          },
+          "previousValue": {
+            "type": "object",
+            "nullable": true,
+            "description": "Full flag snapshot as it was BEFORE the change. Null for CREATED.",
+            "additionalProperties": true
+          },
+          "newValue": {
+            "type": "object",
+            "nullable": true,
+            "description": "Full flag snapshot as it was AFTER the change.",
+            "additionalProperties": true
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "required": [
+          "id",
+          "tenantId",
+          "flagKey",
+          "action",
+          "changedBy",
+          "previousValue",
+          "newValue",
+          "createdAt"
+        ]
+      },
+      "HealthResponseDto": {
+        "type": "object",
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "error"
+            ],
+            "example": "ok"
+          },
+          "timestamp": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "database": {
+            "type": "string",
+            "enum": [
+              "connected",
+              "disconnected"
+            ],
+            "example": "connected"
+          }
+        },
+        "required": [
+          "status",
+          "timestamp",
+          "database"
+        ]
+      }
+    }
+  }
+}

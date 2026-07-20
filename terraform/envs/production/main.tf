@@ -8,8 +8,9 @@ terraform {
   }
 
   # Distinct state prefix from staging — the two environments never share state.
+  # Bucket supplied at init (GCS names are globally unique):
+  #   terraform init -backend-config="bucket=$PROJECT_ID-tfstate"
   backend "gcs" {
-    bucket = "feature-flag-service-tfstate"
     prefix = "terraform/state/production"
   }
 }
@@ -29,7 +30,11 @@ module "env" {
   image_tag   = var.image_tag
   alert_email = var.alert_email
 
-  subnet_cidr     = "10.20.0.0/24"
+  # Mirrors the staging plan, shifted so the two environments never overlap:
+  #   peering_address  10.20.0.0/16   -> Cloud SQL + Memorystore
+  #   subnet_cidr      10.220.0.0/24  -> Cloud Run, via Direct VPC egress
+  peering_address = "10.20.0.0"
+  subnet_cidr     = "10.220.0.0/24"
   db_tier         = "db-custom-2-4096"
   redis_memory_gb = 2
   # Warm instances: flag evaluation is on the request path of every client app, so a cold
@@ -37,7 +42,8 @@ module "env" {
   min_instances = 2
   max_instances = 20
 
-  eval_latency_threshold_ms = 250
+  enable_custom_metric_alerts = var.enable_custom_metric_alerts
+  eval_latency_threshold_ms   = 250
 }
 
 output "service_url" { value = module.env.service_url }

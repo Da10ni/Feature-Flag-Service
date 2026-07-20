@@ -12,7 +12,8 @@ variable "project_id" { type = string }
 variable "region" { type = string }
 variable "environment" { type = string }
 variable "image" { type = string }
-variable "connector_id" { type = string }
+variable "network_id" { type = string }
+variable "subnetwork_id" { type = string }
 variable "db_host" { type = string }
 variable "redis_host" { type = string }
 variable "redis_port" { type = number }
@@ -89,9 +90,18 @@ resource "google_cloud_run_v2_service" "main" {
       max_instance_count = var.max_instances
     }
 
+    # Direct VPC egress: Cloud Run attaches straight to the subnet, with no Serverless VPC
+    # Access connector in the path. Fewer moving parts than a connector, ~$20/month cheaper
+    # per environment, and nothing to strand if a deploy fails mid-way.
+    #
+    # PRIVATE_RANGES_ONLY keeps only RFC1918 traffic on the VPC, so reaching Cloud SQL and
+    # Memorystore goes private while ordinary outbound internet still uses the default path.
     vpc_access {
-      connector = var.connector_id
-      egress    = "PRIVATE_RANGES_ONLY"
+      network_interfaces {
+        network    = var.network_id
+        subnetwork = var.subnetwork_id
+      }
+      egress = "PRIVATE_RANGES_ONLY"
     }
 
     containers {

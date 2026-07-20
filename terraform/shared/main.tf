@@ -15,8 +15,9 @@ terraform {
     }
   }
 
+  # Bucket supplied at init (GCS names are globally unique):
+  #   terraform init -backend-config="bucket=$PROJECT_ID-tfstate"
   backend "gcs" {
-    bucket = "feature-flag-service-tfstate"
     prefix = "terraform/state/shared"
   }
 }

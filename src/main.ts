@@ -4,6 +4,7 @@ import { DataSource } from 'typeorm';
 import { AppModule } from './app.module';
 import { JsonLogger } from './common/logger/json.logger';
 import { runMigrations } from './database/run-migrations';
+import { setupSwagger } from './swagger';
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule, { bufferLogs: true });
@@ -29,6 +30,12 @@ async function bootstrap() {
   app.setGlobalPrefix('api/v1');
   app.useGlobalPipes(new ValidationPipe({ whitelist: true, transform: true }));
   app.enableCors();
+
+  // Registered after the global prefix so the documented paths match the real ones.
+  // Served in every environment: an API whose docs are only available on someone's laptop
+  // is an API nobody can integrate against.
+  setupSwagger(app);
+
   const port = process.env.PORT || 3000;
   await app.listen(port);
   console.log(

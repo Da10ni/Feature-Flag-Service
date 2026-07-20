@@ -19,6 +19,12 @@ services:
       DB_SSL: "false"
       REDIS_HOST: redis
       REDIS_PORT: 6379
+      # Passed through from .env (Compose substitutes it) so the admin guard can be
+      # exercised locally. Defaults to empty when .env is absent, which leaves the guard
+      # disabled — so a fresh clone still works with no setup.
+      ADMIN_API_KEY: ${ADMIN_API_KEY:-}
+      THROTTLE_LIMIT: ${THROTTLE_LIMIT:-6000}
+      THROTTLE_TTL_MS: ${THROTTLE_TTL_MS:-60000}
     volumes:
       - ./src:/app/src
     depends_on:

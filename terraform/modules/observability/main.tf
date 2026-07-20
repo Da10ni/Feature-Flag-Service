@@ -8,6 +8,27 @@ variable "eval_latency_threshold_ms" {
   description = "p95 flag-evaluation latency that should page."
 }
 
+variable "enable_custom_metric_alerts" {
+  type        = bool
+  default     = false
+  description = <<-EOT
+    Create alert policies that reference the application's own Prometheus metrics.
+
+    Off by default because of a bootstrap ordering constraint, not because the alert is
+    optional. Cloud Monitoring validates an alert's query at creation time and rejects it
+    with "Could not find a metric named ..." if the metric descriptor does not yet exist.
+    That descriptor is only created once the service has served real traffic and the
+    Managed Prometheus sidecar has exported it — so on a brand-new project this alert
+    cannot be created in the same apply that creates the service.
+
+    Enable on a second apply, after the service has taken traffic:
+      terraform apply -var="enable_custom_metric_alerts=true"
+
+    The error-rate and uptime alerts below have no such constraint: they use Cloud Run's
+    built-in metrics, which exist from the moment the service does.
+  EOT
+}
+
 resource "google_monitoring_notification_channel" "email" {
   count        = var.alert_email == "" ? 0 : 1
   display_name = "${var.name_prefix} - Email"
@@ -54,6 +75,7 @@ resource "google_monitoring_alert_policy" "error_rate" {
 # request latency — the spec asks specifically for evaluation latency, and request latency
 # would hide a slow evaluation behind fast health checks and CRUD calls.
 resource "google_monitoring_alert_policy" "eval_latency" {
+  count        = var.enable_custom_metric_alerts ? 1 : 0
   display_name = "${var.name_prefix} - Flag Evaluation p95 Latency"
   combiner     = "OR"
 

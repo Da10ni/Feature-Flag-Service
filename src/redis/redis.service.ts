@@ -30,7 +30,20 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
   }
 
   async onModuleDestroy() {
-    await this.client.quit();
+    // quit() rejects with "Connection is closed." when the client is still connecting or
+    // has already gone down — which is exactly the case for a short-lived process that
+    // never issued a command. Unguarded, that rejection propagates out of app.close() and
+    // fails shutdown, which is how it surfaced: an e2e suite that touches no Redis at all
+    // failing during teardown.
+    //
+    // Shutdown is also the one path where a Redis error genuinely does not matter, and the
+    // rest of this class already treats Redis as fail-open.
+    try {
+      await this.client.quit();
+    } catch {
+      // Force the socket down so the process is not held open by a half-open connection.
+      this.client.disconnect();
+    }
   }
 
   async get(key: string): Promise<string | null> {

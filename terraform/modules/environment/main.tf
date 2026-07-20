@@ -12,23 +12,30 @@ variable "environment" { type = string }
 variable "image_tag" { type = string }
 variable "alert_email" { type = string }
 variable "subnet_cidr" { type = string }
+variable "peering_address" {
+  type        = string
+  description = "Start of the /16 reserved for Google service producers. Must not contain subnet_cidr."
+}
 variable "db_tier" { type = string }
 variable "redis_memory_gb" { type = number }
 variable "min_instances" { type = number }
 variable "max_instances" { type = number }
 variable "eval_latency_threshold_ms" { type = number }
+variable "enable_custom_metric_alerts" {
+  type        = bool
+  default     = false
+  description = "See modules/observability — enable on a second apply once the service has served traffic."
+}
 
-# Two GCP resources have name limits far below what "<app_name>-<environment>-*" produces:
-# service account account_id is capped at 30 chars and VPC connector name at 25. With
-# app_name = "feature-flag-service" the long prefix is already 28-31 chars, so those two
-# resources get this abbreviated prefix instead. Everything else keeps the readable name.
+# Service account account_id is capped at 30 characters by GCP, well below what
+# "<app_name>-<environment>-sa" produces (31+ with app_name = "feature-flag-service"), so
+# that one resource uses this abbreviated prefix. Everything else keeps the readable name.
 variable "short_name" {
   type        = string
   default     = "ffs"
   description = "Abbreviated app_name, used only where GCP name limits forbid the full prefix."
   validation {
-    # Longest suffix is "-con" (4). VPC connector cap of 25 is the binding constraint;
-    # keeping the whole short_prefix under 21 satisfies the service account cap of 30 too.
+    # Keeping short_prefix under 12 leaves ample room under the 30-char service account cap.
     condition     = length(var.short_name) <= 12
     error_message = "short_name must be 12 characters or fewer to keep derived names within GCP limits."
   }
@@ -50,11 +57,11 @@ locals {
 }
 
 module "network" {
-  source       = "../network"
-  name_prefix  = local.name_prefix
-  short_prefix = local.short_prefix
-  region       = var.region
-  subnet_cidr  = var.subnet_cidr
+  source          = "../network"
+  name_prefix     = local.name_prefix
+  region          = var.region
+  subnet_cidr     = var.subnet_cidr
+  peering_address = var.peering_address
 }
 
 module "data" {
@@ -78,10 +85,11 @@ module "service" {
   environment  = var.environment
   image        = local.image
 
-  connector_id = module.network.connector_id
-  db_host      = module.data.db_private_ip
-  redis_host   = module.data.redis_host
-  redis_port   = module.data.redis_port
+  network_id    = module.network.network_id
+  subnetwork_id = module.network.subnetwork_id
+  db_host       = module.data.db_private_ip
+  redis_host    = module.data.redis_host
+  redis_port    = module.data.redis_port
 
   db_password_secret_id   = module.data.db_password_secret_id
   db_password_secret_name = module.data.db_password_secret_name
@@ -93,13 +101,14 @@ module "service" {
 }
 
 module "observability" {
-  source                    = "../observability"
-  name_prefix               = local.name_prefix
-  service_name              = local.service_name
-  project_id                = var.project_id
-  service_url               = module.service.url
-  alert_email               = var.alert_email
-  eval_latency_threshold_ms = var.eval_latency_threshold_ms
+  source                      = "../observability"
+  name_prefix                 = local.name_prefix
+  service_name                = local.service_name
+  project_id                  = var.project_id
+  service_url                 = module.service.url
+  alert_email                 = var.alert_email
+  eval_latency_threshold_ms   = var.eval_latency_threshold_ms
+  enable_custom_metric_alerts = var.enable_custom_metric_alerts
 }
 
 output "service_url" { value = module.service.url }

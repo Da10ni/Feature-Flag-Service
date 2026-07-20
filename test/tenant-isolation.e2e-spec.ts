@@ -115,7 +115,10 @@ describe('Tenant Isolation (Integration)', () => {
   it('should reject tenant registration without an admin key', async () => {
     const res = await request(app.getHttpServer())
       .post('/api/v1/tenants')
-      .send({ name: `Unauthorized ${Date.now()}`, slug: `unauth-${Date.now()}` });
+      .send({
+        name: `Unauthorized ${Date.now()}`,
+        slug: `unauth-${Date.now()}`,
+      });
     expect(res.status).toBe(401);
   });
 

@@ -26,3 +26,9 @@ variable "alert_email" {
   type        = string
   default     = ""
 }
+
+variable "enable_custom_metric_alerts" {
+  description = "Create alerts on the app's own Prometheus metrics. Enable on a second apply, after the service has served traffic (see modules/observability)."
+  type        = bool
+  default     = false
+}
