@@ -41,15 +41,18 @@ export function buildOpenApiDocument(app: INestApplication): OpenAPIObject {
       ].join('\n'),
     )
     .setVersion('1.0')
-    .addServer('http://localhost:3000', 'Local (Docker Compose)')
-    .addServer(
-      'https://feature-flag-service-staging-dhqwxiey3q-uc.a.run.app',
-      'Staging (Cloud Run)',
-    )
-    .addServer(
-      'https://feature-flag-service-production-<hash>-uc.a.run.app',
-      'Production (Cloud Run)',
-    )
+    // A RELATIVE server, and it must stay first.
+    //
+    // Swagger UI sends "Try it out" requests to whichever server is selected, defaulting to
+    // the first in this list. With an absolute `http://localhost:3000` first, the deployed
+    // documentation sent every request to the reader's OWN machine — so a staging API key
+    // was validated against whatever happened to be running locally, and came back 401.
+    // The endpoint looked broken when the credential was fine.
+    //
+    // "/" resolves to the origin currently serving the page, so the docs are always correct
+    // wherever they run: localhost when local, Cloud Run when deployed. It also means no
+    // deploy URL has to be hardcoded here at all.
+    .addServer('/', 'This server (whichever origin is serving these docs)')
     .addApiKey(
       {
         type: 'apiKey',
